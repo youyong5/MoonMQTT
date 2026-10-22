@@ -1,0 +1,6 @@
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/socket",
+  "zbhzs1/moonbit-mqtt" @mqtt,
+  "moonbitlang/core/debug",
+}

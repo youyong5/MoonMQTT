@@ -1,0 +1,71 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "youyong5/moonmqtt"
+
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/aqueue",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/debug",
+  "zbhzs1/moonbit-mqtt",
+}
+
+// Values
+pub async fn[X] with_client(Config, async (Client) -> X) -> X
+
+// Errors
+pub suberror MqttError {
+  InvalidConfig(String)
+  Codec(String)
+  Protocol(String)
+  Rejected(@moonbit-mqtt.ConnackReturnCode)
+  Closed
+  TimedOut
+} derive(@debug.Debug)
+pub fn MqttError::to_repr(Self) -> @debug.Repr
+
+// Types and methods
+pub struct Client {
+  config : Config
+  tcp : @socket.Tcp
+  write_lock : @async.Mutex
+  messages : @aqueue.Queue[Message]
+  pending : Map[Int, @aqueue.Queue[@moonbit-mqtt.Packet]]
+  ping_reply : @aqueue.Queue[Unit]
+  mut next_id : Int
+  mut closed : Bool
+  mut last_error : Error?
+  mut disposed : Bool
+  mut reader_task : @async.Task[Unit]?
+  mut heartbeat_task : @async.Task[Unit]?
+}
+pub async fn Client::close(Self) -> Unit
+pub async fn[X] Client::connect(Config, @async.TaskGroup[X]) -> Self
+pub async fn Client::disconnect(Self) -> Unit
+pub async fn Client::publish(Self, String, Bytes, qos? : @moonbit-mqtt.QoS, retain? : Bool) -> Unit
+pub async fn Client::receive(Self) -> Message
+pub async fn Client::subscribe(Self, String, @moonbit-mqtt.QoS) -> @moonbit-mqtt.QoS
+pub async fn Client::unsubscribe(Self, String) -> Unit
+
+pub(all) struct Config {
+  host : String
+  port : Int
+  client_id : String
+  mut username : String?
+  mut password : Bytes?
+  mut keep_alive_seconds : Int
+  mut timeout_ms : Int
+  mut max_packet_size : Int
+}
+pub fn Config::new(String, String, port? : Int) -> Self
+
+pub(all) struct Message {
+  topic : String
+  payload : Bytes
+  qos : @moonbit-mqtt.QoS
+  retain : Bool
+  dup : Bool
+}
+
+// Type aliases
+
+// Traits
