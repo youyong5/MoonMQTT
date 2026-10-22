@@ -44,7 +44,7 @@ try {
     }
 
     $cliProcess = Start-Process -FilePath $subscriberExe `
-      -ArgumentList @('-h', '127.0.0.1', '-p', '1883', '-t', 'moonmqtt/interop/out0', '-t', 'moonmqtt/interop/out', '-q', '1', '-C', '2', '-v') `
+      -ArgumentList @('-h', '127.0.0.1', '-p', '1883', '-t', 'moonmqtt/interop/out0', '-t', 'moonmqtt/interop/out', '-t', 'moonmqtt/interop/out2', '-q', '2', '-C', '3', '-v') `
       -WindowStyle Hidden -PassThru -RedirectStandardOutput $cliMessage `
       -RedirectStandardError $cliError
     Start-Sleep -Milliseconds 500
@@ -54,7 +54,8 @@ try {
     if (-not $cliProcess.WaitForExit(10000)) { throw 'mosquitto_sub timed out' }
     $cliOutput = Get-Content -Raw $cliMessage
     if ($cliOutput -notmatch 'moonmqtt/interop/out0 from MoonBit QoS0' -or
-        $cliOutput -notmatch 'moonmqtt/interop/out from MoonBit') {
+        $cliOutput -notmatch 'moonmqtt/interop/out from MoonBit' -or
+        $cliOutput -notmatch 'moonmqtt/interop/out2 from MoonBit QoS2') {
       throw "Mosquitto subscriber got unexpected data: $(Get-Content -Raw $cliMessage)"
     }
 
@@ -65,7 +66,7 @@ try {
     for ($attempt = 0; $attempt -lt 50; $attempt++) {
       if ($moonProcess.HasExited) { throw "MoonBit subscriber exited: $(Get-Content -Raw $moonError)" }
       $brokerOutput = Get-Content -Raw $brokerError
-      if (([regex]::Matches($brokerOutput, 'Sending SUBACK to moonmqtt-interop-subscriber')).Count -ge 2) {
+      if (([regex]::Matches($brokerOutput, 'Sending SUBACK to moonmqtt-interop-subscriber')).Count -ge 3) {
         $ready = $true
         break
       }
@@ -76,13 +77,16 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'mosquitto_pub QoS 0 failed' }
     & $publisherExe -h 127.0.0.1 -p 1883 -t moonmqtt/interop/in -q 1 -m 'from Mosquitto'
     if ($LASTEXITCODE -ne 0) { throw 'mosquitto_pub QoS 1 failed' }
+    & $publisherExe -h 127.0.0.1 -p 1883 -t moonmqtt/interop/in2 -q 2 -m 'from Mosquitto QoS2'
+    if ($LASTEXITCODE -ne 0) { throw 'mosquitto_pub QoS 2 failed' }
     if (-not $moonProcess.WaitForExit(10000)) { throw 'MoonBit subscriber timed out' }
     $moonOutput = Get-Content -Raw $moonMessage
     if ($moonOutput -notmatch 'moonmqtt/interop/in0: from Mosquitto QoS0' -or
-        $moonOutput -notmatch 'moonmqtt/interop/in: from Mosquitto') {
+        $moonOutput -notmatch 'moonmqtt/interop/in: from Mosquitto' -or
+        $moonOutput -notmatch 'moonmqtt/interop/in2: from Mosquitto QoS2') {
       throw "MoonBit subscriber got unexpected data: $(Get-Content -Raw $moonMessage)"
     }
-    Write-Output 'PASS: basic example and two-way MoonBit/Mosquitto CLI exchange (QoS 0 and 1)'
+    Write-Output 'PASS: basic example and two-way MoonBit/Mosquitto CLI exchange (QoS 0, 1 and 2)'
   }
   finally {
     foreach ($childProcess in @($moonProcess, $cliProcess, $brokerProcess)) {

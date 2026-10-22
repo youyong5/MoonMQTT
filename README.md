@@ -1,20 +1,27 @@
 # MoonMQTT
 
-`youyong5/moonmqtt` 是供其他 MoonBit 程序使用的 MQTT 3.1.1 客户端库。第一阶段通过真实 TCP socket 连接 broker，并使用 [`zbhzs1/moonbit-mqtt` 0.1.0](https://mooncakes.io/docs/zbhzs1/moonbit-mqtt) 编解码报文，使用 [`moonbitlang/async` 0.22.5](https://mooncakes.io/docs/moonbitlang/async) 管理异步 I/O。当前只支持 MoonBit **native** 目标与明文 TCP。
+`youyong5/moonmqtt` 是供其他 MoonBit 程序调用的 MQTT 3.1.1 客户端库。当前使用 `moonbitlang/async` 的原生 TCP socket，使用 `zbhzs1/moonbit-mqtt` 编解码 MQTT 报文。目标平台为 MoonBit **native**，传输为明文 TCP。尚未发布到 Mooncakes。
 
-## 已实现
+## 能力矩阵
 
-- CONNECT/CONNACK，clean session，client ID，可选用户名和密码；拒绝连接会返回具体 CONNACK 原因。
-- SUBSCRIBE/SUBACK、UNSUBSCRIBE/UNSUBACK；单次调用操作一个 topic filter，订阅返回 broker 授予的 QoS。
-- QoS 0 和 QoS 1 PUBLISH 双向收发。QoS 1 发送在匹配的 PUBACK 到达后才完成；收到 QoS 1 消息会回复 PUBACK。支持发布 retain 位，收到的消息保留 retain 和 dup 位。
-- 周期 PINGREQ/PINGRESP、DISCONNECT；Keep Alive 可设为 0 关闭心跳。
-- TCP 分片与连续多个报文的流式读取、报文大小限制、packet ID 分配与响应匹配、连接/写入/确认超时。超时或异常关闭时清理待处理请求并唤醒接收者。
+| 能力 | 第二阶段状态 |
+| --- | --- |
+| CONNECT/CONNACK、拒绝原因、用户名/密码、clean session | 已支持；固定 `clean_session=true` |
+| SUBSCRIBE/SUBACK、UNSUBSCRIBE/UNSUBACK | 已支持；每次一个过滤器，订阅可请求 QoS 0/1/2 |
+| QoS 0 双向发布 | 已支持；发送在 TCP 写入完成后返回 |
+| QoS 1 双向发布 | 已支持；发送等待匹配的 PUBACK；接收在入队后发 PUBACK |
+| QoS 2 双向发布 | 已支持当前连接内四步握手；发送等待 PUBCOMP；接收采用规范的 Method B，按报文 ID 去重，重复 PUBREL 再次确认 |
+| 心跳、正常断开 | PINGREQ/PINGRESP、DISCONNECT 已支持 |
+| 流式读取 | 支持 TCP 分片与合包、最大报文限制 |
+| 待处理请求与队列 | 报文 ID 预留、响应类型/ID 检查、超时和取消清理；接收队列有容量上限 |
+| 持久会话、断线重发、自动重连 | 未实现 |
+| 遗嘱消息、TLS、WebSocket、MQTT 5 | 未实现 |
 
-当前**不声称完整符合 MQTT 3.1.1**：没有 QoS 2、持久会话与重发、自动重连、遗嘱消息、TLS/WebSocket。QoS 1 不跨连接保存消息，因此断线后不保证重新投递。接收队列无容量上限，应用应持续消费。
+接收队列默认容纳 256 条消息，可在连接前设置 `config.inbox_capacity`。队列满时客户端报 `InboxFull` 并终止连接；QoS 1/2 消息只有成功入队后才确认。应用须持续调用 `receive()`。QoS 2 去重状态只保留在当前连接；断线后既不保存入站状态，也不重发出站 PUBLISH/PUBREL，因此**不承诺跨连接的 exactly once 或 QoS 1 至少一次交付**。QoS 1/2 调用在发送中、等待确认时断线或被取消，结果可能已到达 broker，调用方应自行处理这种不确定性。当前超时会终止连接，避免旧确认与同连接后续复用的 ID 混淆。旧 TCP 连接的响应无法进入新 `Client` 的待处理表。
 
-## 最小用法
+## 最小示例
 
-模块尚未发布到 Mooncakes；仓库内的 `examples` 包已按外部使用方方式导入它。发布后，其他项目可先运行 `moon add youyong5/moonmqtt`，再在 `moon.pkg` 中导入本库、`moonbitlang/async` 和 QoS 类型所在的编解码包：
+库在本仓库内可直接运行 `examples/basic`。其他 MoonBit 项目在本模块发布 Mooncakes 版本后可添加依赖；目前可通过 Git 源码集成。`moon.pkg` 需要导入本库、`moonbitlang/async` 和 `zbhzs1/moonbit-mqtt`：
 
 ```moonbit
 import {
@@ -27,11 +34,10 @@ import {
 ```moonbit
 async fn main {
   let config = @client.Config::new("127.0.0.1", "my-client", port=1883)
-  config.keep_alive_seconds = 30
-  config.timeout_ms = 5000
+  config.inbox_capacity = 128
   @client.with_client(config, client => {
-    let granted = client.subscribe("demo/#", @packet.QoS1)
-    client.publish("demo/hello", b"hello", qos=granted)
+    let _ = client.subscribe("demo/#", @packet.QoS2)
+    client.publish("demo/hello", b"hello", qos=@packet.QoS2)
     let message = @async.with_timeout(5000, () => client.receive())
     println(message.topic)
     client.unsubscribe("demo/#")
@@ -39,39 +45,28 @@ async fn main {
 }
 ```
 
-`Config::new` 默认端口 1883、Keep Alive 30 秒、超时 5 秒、最大报文 1 MiB。连接前还可设置 `username`、`password`（`Bytes?`）和 `max_packet_size`。不要在连接后修改传入的配置。
+`Config::new` 默认端口 1883、Keep Alive 30 秒、请求超时 5 秒、最大报文 1 MiB。连接前也可设置 `username`、`password`、`keep_alive_seconds`、`timeout_ms`、`max_packet_size`。连接后不要修改配置。
 
-`with_client` 在回调正常完成时发送 DISCONNECT，异常时关闭连接。若需手动管理生命周期，可在 `@async.with_task_group` 内调用 `Client::connect(config, group)`，结束前调用异步 `client.disconnect()` 或 `client.close()`；任务组必须覆盖全部客户端操作。`close()` 可以重复调用。`receive()` 本身持续等待，调用者可以用 `@async.with_timeout` 限定等待时间。
+`with_client` 创建任务组并在正常返回时发送 DISCONNECT；回调抛错时关闭 TCP。手动使用 `Client::connect(config, group)` 时，任务组须覆盖所有客户端操作，并最终调用异步 `disconnect()` 或 `close()`。`receive()` 一直等待下一条消息或终止错误，可由调用方用 `@async.with_timeout` 限时。
 
-`MqttError` 包含 `InvalidConfig`、`Codec`、`Protocol`、`Rejected`、`Closed` 和 `TimedOut`；底层 async socket 错误和取消也可能直接传播。一次请求超时后连接会关闭，避免迟到确认匹配到以后复用的 packet ID。
+公开错误 `MqttError` 包括 `InvalidConfig`、`Codec`、`Protocol`、`Rejected`、`Closed`、`TimedOut` 和 `InboxFull`。底层 socket 错误及取消也可能传播。`publish` 的 QoS 1/2 成功只表示协议确认完成，不表示订阅方已处理消息。
 
-## 本地运行和测试
+## 运行和测试
 
 ```powershell
 cd D:\Projects\MoonMQTT
 moon check --target native
-moon test --target native
 moon build --target native
-```
-
-安装 Mosquitto（例如 `winget install -e --id EclipseFoundation.Mosquitto --source winget`）后，启动本地 broker（2.x/2.1.x，默认本机监听 1883），再运行库使用示例：
-
-```powershell
-& 'C:\Program Files\mosquitto\mosquitto.exe' -p 1883 -v
-# 另一个 PowerShell 窗口：
+moon test --target native
 moon run examples/basic --target native
 ```
 
-双向 CLI 互通脚本在安装 Mosquitto 后运行：
+端到端测试需要 Mosquitto broker 及 `mosquitto_pub`、`mosquitto_sub`。脚本自行启动和关闭本地 broker，验证 MoonBit 与 CLI 双向 QoS 0/1/2：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\interop.ps1
+# 若 Mosquitto 不在默认安装目录：
+powershell -ExecutionPolicy Bypass -File tests\interop.ps1 -MosquittoDirectory 'D:\path\to\mosquitto\bin'
 ```
 
-脚本验证最小示例、MoonBit QoS 0/1 发布 → `mosquitto_sub` 收取，以及 `mosquitto_pub` QoS 0/1 发布 → MoonBit 订阅者收取。可用 `-MosquittoDirectory` 指定其他安装目录。脚本会自行启动并关闭 broker，运行它时无需先执行上面的启动命令。测试日志保存在 `.tools/interop`。手动运行两端的程序位于 `examples/interop_pub` 和 `examples/interop_sub`。
-
-仓库中的 10 个 native 测试使用本地 TCP 假 broker，覆盖拒绝连接、异常断开、错误报文、分片、合包、QoS 0/1、心跳、确认匹配和超时。**本机另用 MSYS2 打包的 Mosquitto 2.0.22 broker 与命令行客户端运行 `tests/interop.ps1`，最小示例以及 QoS 0/1 双向互通均通过。**
-
-## 设计与后续
-
-[设计记录](docs/design.md)记录了标准依据、依赖选择、与现有编解码包的差异和异步生命周期。下一阶段按以下顺序扩展：QoS 2 完整双向状态机；持久会话/恢复与在途消息重发；自动重连与退避；遗嘱消息；TLS 传输和证书验证。
+本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出及 QoS 2 重复报文。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。
