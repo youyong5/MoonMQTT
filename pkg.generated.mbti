@@ -20,6 +20,7 @@ pub suberror MqttError {
   Rejected(@moonbit-mqtt.ConnackReturnCode)
   Closed
   TimedOut
+  InboxFull
 } derive(@debug.Debug)
 pub fn MqttError::to_repr(Self) -> @debug.Repr
 
@@ -29,7 +30,8 @@ pub struct Client {
   tcp : @socket.Tcp
   write_lock : @async.Mutex
   messages : @aqueue.Queue[Message]
-  pending : Map[Int, @aqueue.Queue[@moonbit-mqtt.Packet]]
+  pending : Map[Int, Pending]
+  incoming_qos2 : Map[Int, Bool]
   ping_reply : @aqueue.Queue[Unit]
   mut next_id : Int
   mut closed : Bool
@@ -55,6 +57,7 @@ pub(all) struct Config {
   mut keep_alive_seconds : Int
   mut timeout_ms : Int
   mut max_packet_size : Int
+  mut inbox_capacity : Int
 }
 pub fn Config::new(String, String, port? : Int) -> Self
 
@@ -65,6 +68,10 @@ pub(all) struct Message {
   retain : Bool
   dup : Bool
 }
+
+type Pending
+
+type PendingKind
 
 // Type aliases
 

@@ -308,14 +308,14 @@ async test "wrong PUBACK identifier cannot complete QoS 1 publish" {
     config.keep_alive_seconds = 0
     config.timeout_ms = 100
     let client = Client::connect(config, group)
-    let timed_out = try {
+    let rejected = try {
       client.publish("test/ack", b"payload", qos=@mqtt.QoS1)
       false
     } catch {
-      TimedOut => true
+      Protocol(_) => true
       _ => false
     }
-    assert_true(timed_out)
+    assert_true(rejected)
     client.close()
   }
 }

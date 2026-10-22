@@ -9,6 +9,7 @@ pub(all) struct Config {
   mut keep_alive_seconds : Int32
   mut timeout_ms : Int32
   mut max_packet_size : Int32
+  mut inbox_capacity : Int32
 }
 
 ///|
@@ -26,6 +27,7 @@ pub fn Config::new(
     keep_alive_seconds: 30,
     timeout_ms: 5000,
     max_packet_size: 1024 * 1024,
+    inbox_capacity: 256,
   }
 }
 
@@ -46,10 +48,26 @@ pub suberror MqttError {
   Rejected(@mqtt.ConnackReturnCode)
   Closed
   TimedOut
+  InboxFull
 } derive(Debug)
 
 ///|
 pub extend MqttError with @debug.Debug::{to_repr}
+
+///|
+enum PendingKind {
+  Puback
+  Suback
+  Unsuback
+  Pubrec
+  Pubcomp
+}
+
+///|
+struct Pending {
+  mut kind : PendingKind
+  reply : @async.Queue[@mqtt.Packet]
+}
 
 ///|
 pub struct Client {
@@ -57,7 +75,8 @@ pub struct Client {
   tcp : @socket.Tcp
   write_lock : @async.Mutex
   messages : @async.Queue[Message]
-  pending : Map[Int32, @async.Queue[@mqtt.Packet]]
+  pending : Map[Int32, Pending]
+  incoming_qos2 : Map[Int32, Bool]
   ping_reply : @async.Queue[Unit]
   mut next_id : Int32
   mut closed : Bool
@@ -85,9 +104,10 @@ fn validate(config : Config) -> Unit raise MqttError {
     config.keep_alive_seconds > 65535 ||
     config.timeout_ms <= 0 ||
     config.max_packet_size < 4 ||
-    config.max_packet_size > 268435460 {
+    config.max_packet_size > 268435460 ||
+    config.inbox_capacity < 1 {
     raise InvalidConfig(
-      "invalid host, client ID, port, keep alive, timeout or packet limit",
+      "invalid host, client ID, port, keep alive, timeout or queue/packet limit",
     )
   }
   if config.password is Some(_) && config.username is None {
@@ -120,10 +140,11 @@ fn Client::finish(self : Client, reason : Error) -> Unit {
     }
     self.messages.close(error=reason)
     self.ping_reply.close(error=reason)
-    for _, queue in self.pending {
-      queue.close(error=reason)
+    for _, pending in self.pending {
+      pending.reply.close(error=reason)
     }
     self.pending.clear()
+    self.incoming_qos2.clear()
   }
 }
 
@@ -236,12 +257,37 @@ fn Client::allocate_id(self : Client) -> Int32 raise MqttError {
 }
 
 ///|
+fn Client::reserve(self : Client, kind : PendingKind) -> Int32 raise {
+  self.ensure_open()
+  let id = self.allocate_id()
+  self.pending[id] = { kind, reply: @async.Queue::Queue(kind=Blocking(1)), }
+  id
+}
+
+///|
 fn Client::resolve(self : Client, id : Int32, packet : @mqtt.Packet) -> Unit {
   match self.pending.get(id) {
-    Some(queue) => {
-      let _ = queue.try_put(packet) catch { _ => false }
+    Some(pending) => {
+      let valid = match (pending.kind, packet) {
+        (Puback, PubackPacket(_))
+        | (Suback, SubackPacket(_))
+        | (Unsuback, UnsubackPacket(_))
+        | (Pubrec, PubrecPacket(_))
+        | (Pubcomp, PubcompPacket(_)) => true
+        _ => false
+      }
+      if !valid {
+        self.finish(Protocol("acknowledgement type does not match packet ID"))
+      } else {
+        let queued = pending.reply.try_put(packet) catch { _ => false }
+        if !queued && !(pending.kind is Pubrec) {
+          self.finish(
+            Protocol("duplicate acknowledgement before request advanced"),
+          )
+        }
+      }
     }
-    None => ()
+    None => self.finish(Protocol("acknowledgement for unknown packet ID"))
   }
 }
 
@@ -267,32 +313,53 @@ async fn Client::reader(self : Client) -> Unit {
     }
     match packet {
       PublishPacket(publish) => {
-        if publish.qos == @mqtt.QoS2 {
-          self.finish(Protocol("incoming QoS 2 is unsupported"))
-          return
-        }
-        if publish.qos == @mqtt.QoS1 {
-          let id = match publish.message_id {
-            Some(id) => id
+        let id = publish.message_id
+        let duplicate_qos2 = if publish.qos == @mqtt.QoS2 {
+          match id {
+            Some(id) => self.incoming_qos2.get(id) is Some(false)
             None => {
-              self.finish(Protocol("QoS 1 PUBLISH has no ID"))
+              self.finish(Protocol("QoS 2 PUBLISH has no ID"))
               return
             }
           }
-          self.send(encoded(@mqtt.encode_puback(id))) catch {
-            e => {
-              self.finish(e)
-              return
-            }
+        } else {
+          false
+        }
+        if !duplicate_qos2 {
+          let accepted = self.messages.try_put({
+            topic: publish.topic,
+            payload: publish.payload,
+            qos: publish.qos,
+            retain: publish.retain,
+            dup: publish.dup,
+          }) catch {
+            _ => false
+          }
+          if !accepted {
+            self.finish(InboxFull)
+            return
           }
         }
-        self.messages.put({
-          topic: publish.topic,
-          payload: publish.payload,
-          qos: publish.qos,
-          retain: publish.retain,
-          dup: publish.dup,
-        }) catch {
+        try {
+          match publish.qos {
+            @mqtt.QoS0 => ()
+            @mqtt.QoS1 =>
+              match id {
+                Some(id) => self.send(encoded(@mqtt.encode_puback(id)))
+                None => raise Protocol("QoS 1 PUBLISH has no ID")
+              }
+            @mqtt.QoS2 =>
+              match id {
+                Some(id) => {
+                  if !duplicate_qos2 {
+                    self.incoming_qos2[id] = false
+                  }
+                  self.send(encoded(@mqtt.encode_pubrec(id)))
+                }
+                None => raise Protocol("QoS 2 PUBLISH has no ID")
+              }
+          }
+        } catch {
           e => {
             self.finish(e)
             return
@@ -300,6 +367,40 @@ async fn Client::reader(self : Client) -> Unit {
         }
       }
       PubackPacket(id) => self.resolve(id.message_id, packet)
+      PubrecPacket(id) =>
+        match self.pending.get(id.message_id) {
+          Some(pending) if pending.kind is Pubcomp =>
+            // A repeated PUBREC asks for PUBREL again, never PUBLISH.
+            self.send(encoded(@mqtt.encode_pubrel(id.message_id))) catch {
+              e => {
+                self.finish(e)
+                return
+              }
+            }
+          _ => self.resolve(id.message_id, packet)
+        }
+      PubcompPacket(id) => self.resolve(id.message_id, packet)
+      PubrelPacket(id) =>
+        match self.incoming_qos2.get(id.message_id) {
+          Some(_) => {
+            self.incoming_qos2[id.message_id] = true
+            self.send(encoded(@mqtt.encode_pubcomp(id.message_id))) catch {
+              e => {
+                self.finish(e)
+                return
+              }
+            }
+          }
+          None =>
+            // MQTT 3.1.1 requires PUBCOMP for every PUBREL, including a
+            // duplicate whose completed state is no longer available.
+            self.send(encoded(@mqtt.encode_pubcomp(id.message_id))) catch {
+              e => {
+                self.finish(e)
+                return
+              }
+            }
+        }
       SubackPacket(ack) => self.resolve(ack.message_id, packet)
       UnsubackPacket(ack) => self.resolve(ack.message_id, packet)
       PingrespPacket => {
@@ -363,8 +464,9 @@ pub async fn[X] Client::connect(
     config,
     tcp,
     write_lock: @async.Mutex::Mutex(),
-    messages: @async.Queue::Queue(kind=Unbounded),
+    messages: @async.Queue::Queue(kind=Blocking(config.inbox_capacity)),
     pending: Map([]),
+    incoming_qos2: Map([]),
     ping_reply: @async.Queue::Queue(kind=DiscardOldest(1)),
     next_id: 1,
     closed: false,
@@ -460,47 +562,57 @@ pub async fn Client::receive(self : Client) -> Message {
 ///|
 async fn Client::request(
   self : Client,
-  id : Int32,
-  bytes : Array[Byte],
+  kind : PendingKind,
+  make_bytes : (Int32) -> Result[Array[Byte], String],
 ) -> @mqtt.Packet {
-  let queue = @async.Queue::Queue(kind=Blocking(1))
-  self.pending[id] = queue
+  let id = self.reserve(kind)
   defer self.pending.remove(id)
-  self.send(bytes)
-  let answer = @async.with_timeout_opt(self.config.timeout_ms, () => queue.get())
-  match answer {
-    Some(packet) => packet
-    None => {
-      self.finish(TimedOut)
-      raise TimedOut
+  let mut completed = false
+  defer (if !completed { self.finish(Closed) })
+  let result : Result[@mqtt.Packet, Error] = try {
+    let bytes = encoded(make_bytes(id))
+    self.send(bytes)
+    let pending = self.pending.get(id).unwrap()
+    match
+      @async.with_timeout_opt(self.config.timeout_ms, () => pending.reply.get()) {
+      Some(packet) => Ok(packet)
+      None => Err(TimedOut)
+    }
+  } catch {
+    e => Err(e)
+  }
+  match result {
+    Ok(packet) => {
+      completed = true
+      packet
+    }
+    Err(e) => {
+      self.finish(e)
+      raise e
     }
   }
 }
 
 ///|
-/// Subscribe to one filter at QoS 0 or 1. Returns the granted QoS.
+/// Subscribe to one filter at QoS 0, 1 or 2. Returns the granted QoS.
 pub async fn Client::subscribe(
   self : Client,
   filter : String,
   qos : @mqtt.QoS,
 ) -> @mqtt.QoS {
   self.ensure_open()
-  if qos == @mqtt.QoS2 {
-    raise InvalidConfig("QoS 2 is unsupported")
-  }
-  let id = self.allocate_id()
-  let bytes = encoded(
-    @mqtt.encode_subscribe({
-      message_id: id,
-      topics: [{ topic: filter, qos, }],
-    }),
-  )
-  match self.request(id, bytes) {
+  match
+    self.request(Suback, id => {
+      @mqtt.encode_subscribe({
+        message_id: id,
+        topics: [{ topic: filter, qos, }],
+      })
+    }) {
     SubackPacket(ack) if ack.return_codes.length() == 1 =>
       match ack.return_codes[0] {
         SuccessQoS0 => @mqtt.QoS0
         SuccessQoS1 => @mqtt.QoS1
-        SuccessQoS2 => raise Protocol("server granted unsupported QoS 2")
+        SuccessQoS2 => @mqtt.QoS2
         Failure => raise Protocol("subscription rejected")
       }
     _ => raise Protocol("expected matching SUBACK")
@@ -510,18 +622,17 @@ pub async fn Client::subscribe(
 ///|
 pub async fn Client::unsubscribe(self : Client, filter : String) -> Unit {
   self.ensure_open()
-  let id = self.allocate_id()
-  let bytes = encoded(
-    @mqtt.encode_unsubscribe({ message_id: id, topics: [filter], }),
-  )
-  match self.request(id, bytes) {
+  match
+    self.request(Unsuback, id => {
+      @mqtt.encode_unsubscribe({ message_id: id, topics: [filter], })
+    }) {
     UnsubackPacket(_) => ()
     _ => raise Protocol("expected matching UNSUBACK")
   }
 }
 
 ///|
-/// QoS 1 completes on the matching PUBACK; QoS 0 completes after TCP write.
+/// QoS 1 completes on PUBACK; QoS 2 completes on PUBCOMP.
 pub async fn Client::publish(
   self : Client,
   topic : String,
@@ -530,27 +641,69 @@ pub async fn Client::publish(
   retain~ : Bool = false,
 ) -> Unit {
   self.ensure_open()
-  if qos == @mqtt.QoS2 {
-    raise InvalidConfig("QoS 2 is unsupported")
+  if qos == @mqtt.QoS0 {
+    self.send(
+      encoded(
+        @mqtt.encode_publish({
+          topic,
+          payload,
+          qos,
+          message_id: None,
+          retain,
+          dup: false,
+        }),
+      ),
+    )
+    return
   }
-  let id = if qos == @mqtt.QoS1 { Some(self.allocate_id()) } else { None }
-  let bytes = encoded(
-    @mqtt.encode_publish({
-      topic,
-      payload,
-      qos,
-      message_id: id,
-      retain,
-      dup: false,
-    }),
-  )
-  match id {
-    Some(id) =>
-      match self.request(id, bytes) {
-        PubackPacket(_) => ()
-        _ => raise Protocol("expected matching PUBACK")
+  let kind = if qos == @mqtt.QoS1 { Puback } else { Pubrec }
+  let id = self.reserve(kind)
+  defer self.pending.remove(id)
+  let mut completed = false
+  defer (if !completed { self.finish(Closed) })
+  let result = try {
+    let bytes = encoded(
+      @mqtt.encode_publish({
+        topic,
+        payload,
+        qos,
+        message_id: Some(id),
+        retain,
+        dup: false,
+      }),
+    )
+    self.send(bytes)
+    let pending = self.pending.get(id).unwrap()
+    let first = @async.with_timeout_opt(self.config.timeout_ms, () => {
+      pending.reply.get()
+    })
+    match (qos, first) {
+      (@mqtt.QoS1, Some(PubackPacket(_))) => ()
+      (@mqtt.QoS2, Some(PubrecPacket(_))) => {
+        pending.kind = Pubcomp
+        self.send(encoded(@mqtt.encode_pubrel(id)))
+        let final_ack = @async.with_timeout_opt(self.config.timeout_ms, () => {
+          pending.reply.get()
+        })
+        match final_ack {
+          Some(PubcompPacket(_)) => ()
+          None => raise TimedOut
+          _ => raise Protocol("expected PUBCOMP")
+        }
       }
-    None => self.send(bytes)
+      (_, None) => raise TimedOut
+      _ => raise Protocol("unexpected publish acknowledgement")
+    }
+    Ok(())
+  } catch {
+    e => Err(e)
+  }
+  match result {
+    Ok(_) => completed = true
+    Err(e) => {
+      self.finish(e)
+      raise e
+    }
   }
 }
 
@@ -570,5 +723,7 @@ pub async fn Client::disconnect(self : Client) -> Unit {
       Ok(_) => ()
       Err(e) => raise e
     }
+  } else {
+    self.close()
   }
 }
