@@ -14,7 +14,7 @@
 
 ## 最小用法
 
-在使用方的 `moon.pkg` 中导入本库、`moonbitlang/async` 和 QoS 类型所在的编解码包：
+模块尚未发布到 Mooncakes；仓库内的 `examples` 包已按外部使用方方式导入它。发布后，其他项目可先运行 `moon add youyong5/moonmqtt`，再在 `moon.pkg` 中导入本库、`moonbitlang/async` 和 QoS 类型所在的编解码包：
 
 ```moonbit
 import {

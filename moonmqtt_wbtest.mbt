@@ -311,7 +311,10 @@ async test "wrong PUBACK identifier cannot complete QoS 1 publish" {
     let timed_out = try {
       client.publish("test/ack", b"payload", qos=@mqtt.QoS1)
       false
-    } catch { TimedOut => true; _ => false }
+    } catch {
+      TimedOut => true
+      _ => false
+    }
     assert_true(timed_out)
     client.close()
   }
@@ -330,11 +333,18 @@ async test "partial packet body times out" {
       conn.write(b"\x30\x0A\x00")
       @async.sleep(300)
     }
-    let config = Config::new("127.0.0.1", "partial-body", port=server.addr.port())
+    let config = Config::new(
+      "127.0.0.1",
+      "partial-body",
+      port=server.addr.port(),
+    )
     config.keep_alive_seconds = 0
     config.timeout_ms = 100
     let client = Client::connect(config, group)
-    let timed_out = try { let _ = client.receive(); false } catch {
+    let timed_out = try {
+      let _ = client.receive()
+      false
+    } catch {
       TimedOut => true
       _ => false
     }
