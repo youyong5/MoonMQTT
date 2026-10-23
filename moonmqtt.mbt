@@ -10,6 +10,7 @@ pub(all) struct Config {
   mut timeout_ms : Int32
   mut max_packet_size : Int32
   mut inbox_capacity : Int32
+  mut clean_session : Bool
 }
 
 ///|
@@ -28,6 +29,7 @@ pub fn Config::new(
     timeout_ms: 5000,
     max_packet_size: 1024 * 1024,
     inbox_capacity: 256,
+    clean_session: true,
   }
 }
 
@@ -71,15 +73,72 @@ struct Pending {
 }
 
 ///|
+enum OutStage {
+  WaitPuback
+  WaitPubrec
+  WaitPubcomp
+}
+
+///|
+struct Outgoing {
+  topic : String
+  payload : Bytes
+  qos : @mqtt.QoS
+  retain : Bool
+  mut stage : OutStage
+  mut pubrel_sent : Bool
+}
+
+///|
+struct Session {
+  client_id : String
+  mut next_id : Int32
+  outgoing : Map[Int32, Outgoing]
+  mut order : Array[Int32]
+  incoming_qos2 : Map[Int32, Bool]
+  subscriptions : Map[String, @mqtt.QoS]
+  mut backlog : Array[Message]
+  mut ever_connected : Bool
+  mut active : Bool
+}
+
+///|
+fn Session::new(client_id : String) -> Session {
+  {
+    client_id,
+    next_id: 1,
+    outgoing: Map([]),
+    order: [],
+    incoming_qos2: Map([]),
+    subscriptions: Map([]),
+    backlog: [],
+    ever_connected: false,
+    active: false,
+  }
+}
+
+///|
+fn Session::forget_outgoing(self : Session, id : Int32) -> Unit {
+  self.outgoing.remove(id)
+  let remaining : Array[Int32] = []
+  for old_id in self.order {
+    if old_id != id {
+      remaining.push(old_id)
+    }
+  }
+  self.order = remaining
+}
+
+///|
 pub struct Client {
   config : Config
+  session : Session
   tcp : @socket.Tcp
   write_lock : @async.Mutex
   messages : @async.Queue[Message]
   pending : Map[Int32, Pending]
-  incoming_qos2 : Map[Int32, Bool]
   ping_reply : @async.Queue[Unit]
-  mut next_id : Int32
+  mut session_present : Bool
   mut closed : Bool
   mut last_error : Error?
   mut disposed : Bool
@@ -131,6 +190,7 @@ fn Client::finish(self : Client, reason : Error) -> Unit {
   if !self.closed {
     self.closed = true
     self.last_error = Some(reason)
+    self.session.active = false
     match self.reader_task {
       Some(task) => task.cancel()
       None => ()
@@ -139,13 +199,26 @@ fn Client::finish(self : Client, reason : Error) -> Unit {
       Some(task) => task.cancel()
       None => ()
     }
-    self.messages.close(error=reason)
-    self.ping_reply.close(error=reason)
+    if !self.config.clean_session {
+      while true {
+        let next = self.messages.try_get() catch { _ => None }
+        match next {
+          Some(message) => self.session.backlog.push(message)
+          None => break
+        }
+      }
+    } else {
+      self.session.outgoing.clear()
+      self.session.order = []
+      self.session.incoming_qos2.clear()
+      self.session.subscriptions.clear()
+    }
+    self.messages.close(error=reason, clear=true)
+    self.ping_reply.close(error=reason, clear=true)
     for _, pending in self.pending {
-      pending.reply.close(error=reason)
+      pending.reply.close(error=reason, clear=true)
     }
     self.pending.clear()
-    self.incoming_qos2.clear()
   }
 }
 
@@ -248,9 +321,9 @@ async fn Client::send(self : Client, bytes : Array[Byte]) -> Unit {
 ///|
 fn Client::allocate_id(self : Client) -> Int32 raise MqttError {
   for _ in 0..<65535 {
-    let id = self.next_id
-    self.next_id = if id == 65535 { 1 } else { id + 1 }
-    if !self.pending.contains(id) {
+    let id = self.session.next_id
+    self.session.next_id = if id == 65535 { 1 } else { id + 1 }
+    if !self.pending.contains(id) && !self.session.outgoing.contains(id) {
       return id
     }
   }
@@ -326,7 +399,7 @@ async fn Client::reader(self : Client) -> Unit {
         let id = publish.message_id
         let duplicate_qos2 = if publish.qos == @mqtt.QoS2 {
           match id {
-            Some(id) => self.incoming_qos2.get(id) is Some(false)
+            Some(id) => self.session.incoming_qos2.get(id) is Some(false)
             None => {
               self.finish(Protocol("QoS 2 PUBLISH has no ID"))
               return
@@ -362,7 +435,7 @@ async fn Client::reader(self : Client) -> Unit {
               match id {
                 Some(id) => {
                   if !duplicate_qos2 {
-                    self.incoming_qos2[id] = false
+                    self.session.incoming_qos2[id] = false
                   }
                   self.send(encoded(@mqtt.encode_pubrec(id)))
                 }
@@ -376,24 +449,58 @@ async fn Client::reader(self : Client) -> Unit {
           }
         }
       }
-      PubackPacket(id) => self.resolve(id.message_id, packet)
+      PubackPacket(id) =>
+        match self.session.outgoing.get(id.message_id) {
+          Some(flow) if flow.stage is WaitPuback => {
+            self.session.forget_outgoing(id.message_id)
+            if self.pending.contains(id.message_id) {
+              self.resolve(id.message_id, packet)
+            }
+          }
+          _ => self.finish(Protocol("unexpected PUBACK ID or stage"))
+        }
       PubrecPacket(id) =>
-        match self.pending.get(id.message_id) {
-          Some(pending) if pending.kind is Pubcomp =>
-            // A repeated PUBREC asks for PUBREL again, never PUBLISH.
-            self.send(encoded(@mqtt.encode_pubrel(id.message_id))) catch {
-              e => {
-                self.finish(e)
-                return
+        match self.session.outgoing.get(id.message_id) {
+          Some(flow) if flow.stage is WaitPubrec => {
+            flow.stage = WaitPubcomp
+            if self.pending.contains(id.message_id) {
+              self.resolve(id.message_id, packet)
+            } else {
+              flow.pubrel_sent = true
+              self.send(encoded(@mqtt.encode_pubrel(id.message_id))) catch {
+                e => {
+                  self.finish(e)
+                  return
+                }
               }
             }
-          _ => self.resolve(id.message_id, packet)
+          }
+          Some(flow) if flow.stage is WaitPubcomp =>
+            if flow.pubrel_sent {
+              // Once PUBREL was attempted, duplicate PUBREC repeats PUBREL.
+              self.send(encoded(@mqtt.encode_pubrel(id.message_id))) catch {
+                e => {
+                  self.finish(e)
+                  return
+                }
+              }
+            }
+          _ => self.finish(Protocol("unexpected PUBREC ID or stage"))
         }
-      PubcompPacket(id) => self.resolve(id.message_id, packet)
+      PubcompPacket(id) =>
+        match self.session.outgoing.get(id.message_id) {
+          Some(flow) if flow.stage is WaitPubcomp => {
+            self.session.forget_outgoing(id.message_id)
+            if self.pending.contains(id.message_id) {
+              self.resolve(id.message_id, packet)
+            }
+          }
+          _ => self.finish(Protocol("unexpected PUBCOMP ID or stage"))
+        }
       PubrelPacket(id) =>
-        match self.incoming_qos2.get(id.message_id) {
+        match self.session.incoming_qos2.get(id.message_id) {
           Some(_) => {
-            self.incoming_qos2[id.message_id] = true
+            self.session.incoming_qos2[id.message_id] = true
             self.send(encoded(@mqtt.encode_pubcomp(id.message_id))) catch {
               e => {
                 self.finish(e)
@@ -456,6 +563,37 @@ async fn Client::heartbeat(self : Client) -> Unit {
   }
 }
 
+///|
+/// Replay in original publication order. MQTT 3.1.1 retransmits PUBREL
+/// without changing its reserved fixed-header flags.
+async fn Client::replay_outgoing(self : Client) -> Unit {
+  for id in self.session.order {
+    match self.session.outgoing.get(id) {
+      Some(flow) =>
+        match flow.stage {
+          WaitPuback | WaitPubrec =>
+            self.send(
+              encoded(
+                @mqtt.encode_publish({
+                  topic: flow.topic,
+                  payload: flow.payload,
+                  qos: flow.qos,
+                  message_id: Some(id),
+                  retain: flow.retain,
+                  dup: true,
+                }),
+              ),
+            )
+          WaitPubcomp => {
+            flow.pubrel_sent = true
+            self.send(encoded(@mqtt.encode_pubrel(id)))
+          }
+        }
+      None => ()
+    }
+  }
+}
+
 ///| Start one reader and one optional heartbeat task in `group`.
 
 ///|
@@ -464,34 +602,76 @@ pub async fn[X] Client::connect(
   config : Config,
   group : @async.TaskGroup[X],
 ) -> Client {
+  connect_with_session(config, Session::new(config.client_id), group)
+}
+
+///|
+/// Reconnect a persistent session using the same client ID and in-memory state.
+pub async fn[X] Client::reconnect(
+  self : Client,
+  group : @async.TaskGroup[X],
+) -> Client {
+  if self.config.clean_session {
+    raise InvalidConfig("reconnect requires clean_session=false")
+  }
+  self.close()
+  connect_with_session(self.config, self.session, group)
+}
+
+///|
+/// Reports the Session Present bit received on this connection's CONNACK.
+pub fn Client::session_present(self : Client) -> Bool {
+  self.session_present
+}
+
+///|
+async fn[X] connect_with_session(
+  config : Config,
+  session : Session,
+  group : @async.TaskGroup[X],
+) -> Client {
   validate(config)
+  if session.client_id != config.client_id {
+    raise InvalidConfig("persistent session client ID changed")
+  }
+  if session.active {
+    raise InvalidConfig("session is already connected or reconnecting")
+  }
+  session.active = true
+  errdefer {
+    session.active = false
+  }
   let tcp = @async.with_timeout(
     config.timeout_ms,
     () => @socket.Tcp::connect_to_host(config.host, port=config.port),
     error=TimedOut,
   )
+  let mut tcp_owned_by_client = false
+  errdefer (if !tcp_owned_by_client { tcp.close() })
   let client = {
     config,
+    session,
     tcp,
     write_lock: @async.Mutex::Mutex(),
     messages: @async.Queue::Queue(kind=Blocking(config.inbox_capacity)),
     pending: Map([]),
-    incoming_qos2: Map([]),
     ping_reply: @async.Queue::Queue(kind=DiscardOldest(1)),
-    next_id: 1,
+    session_present: false,
     closed: false,
     last_error: None,
     disposed: false,
     reader_task: None,
     heartbeat_task: None,
   }
+  tcp_owned_by_client = true
+  errdefer @async.protect_from_cancel(() => client.close())
   let flags = @mqtt.ConnectFlags::{
     username: config.username is Some(_),
     password: config.password is Some(_),
     will_retain: false,
     will_qos: @mqtt.QoS0,
     will_flag: false,
-    clean_session: true,
+    clean_session: config.clean_session,
   }
   let packet = @mqtt.Connect::{
     client_id: config.client_id,
@@ -502,7 +682,7 @@ pub async fn[X] Client::connect(
     keep_alive: config.keep_alive_seconds,
     flags,
   }
-  let handshake = try {
+  let handshake : Result[Bool, Error] = try {
     client.send(encoded(@mqtt.encode_connect(packet)))
     let frame = @async.with_timeout(
       config.timeout_ms,
@@ -514,24 +694,50 @@ pub async fn[X] Client::connect(
         if ack.return_code != @mqtt.ConnectionAccepted {
           raise Rejected(ack.return_code)
         }
-        if ack.session_present {
+        if config.clean_session && ack.session_present {
           raise Protocol("clean session CONNACK has session present set")
         }
+        if !config.clean_session &&
+          !session.ever_connected &&
+          ack.session_present {
+          raise Protocol(
+            "server session exists but local session state is unavailable",
+          )
+        }
+        Ok(ack.session_present)
       }
       Ok(_) => raise Protocol("expected CONNACK")
       Err(reason) => raise Protocol(reason)
     }
-    Ok(())
   } catch {
     e => Err(e)
   }
   match handshake {
-    Ok(_) => ()
-    Err(e) => {
-      client.finish(e)
-      client.close()
-      raise e
+    Ok(present) => {
+      client.session_present = present
+      if !config.clean_session {
+        if present {
+          if session.backlog.length() > config.inbox_capacity {
+            client.finish(InboxFull)
+            client.close()
+            raise InboxFull
+          }
+          let backlog = session.backlog
+          session.backlog = []
+          for message in backlog {
+            let _ = client.messages.try_put(message) catch { _ => false }
+          }
+        } else {
+          session.outgoing.clear()
+          session.order = []
+          session.incoming_qos2.clear()
+          session.backlog = []
+          session.next_id = 1
+        }
+      }
+      session.ever_connected = true
     }
+    Err(e) => raise e
   }
   client.reader_task = Some(
     group.spawn(no_wait=true, allow_failure=true) <| () => { client.reader() },
@@ -541,6 +747,28 @@ pub async fn[X] Client::connect(
       client.heartbeat()
     },
   )
+  let recovered = try {
+    if !config.clean_session {
+      if client.session_present {
+        client.replay_outgoing()
+      } else {
+        let filters : Array[(String, @mqtt.QoS)] = []
+        for filter, qos in session.subscriptions {
+          filters.push((filter, qos))
+        }
+        for (filter, qos) in filters {
+          let _ = client.subscribe(filter, qos)
+        }
+      }
+    }
+    Ok(())
+  } catch {
+    e => Err(e)
+  }
+  match recovered {
+    Ok(_) => ()
+    Err(e) => raise e
+  }
   client
 }
 
@@ -611,7 +839,7 @@ pub async fn Client::subscribe(
   qos : @mqtt.QoS,
 ) -> @mqtt.QoS {
   self.ensure_open()
-  match
+  let granted = match
     self.request(Suback, id => {
       @mqtt.encode_subscribe({
         message_id: id,
@@ -627,6 +855,9 @@ pub async fn Client::subscribe(
       }
     _ => raise Protocol("expected matching SUBACK")
   }
+  // Restore the requested maximum QoS, not a broker's previous grant.
+  self.session.subscriptions[filter] = qos
+  granted
 }
 
 ///|
@@ -636,7 +867,7 @@ pub async fn Client::unsubscribe(self : Client, filter : String) -> Unit {
     self.request(Unsuback, id => {
       @mqtt.encode_unsubscribe({ message_id: id, topics: [filter], })
     }) {
-    UnsubackPacket(_) => ()
+    UnsubackPacket(_) => self.session.subscriptions.remove(filter)
     _ => raise Protocol("expected matching UNSUBACK")
   }
 }
@@ -682,15 +913,32 @@ pub async fn Client::publish(
         dup: false,
       }),
     )
+    self.session.outgoing[id] = {
+      topic,
+      payload,
+      qos,
+      retain,
+      stage: if qos == @mqtt.QoS1 {
+        WaitPuback
+      } else {
+        WaitPubrec
+      },
+      pubrel_sent: false,
+    }
+    self.session.order.push(id)
     self.send(bytes)
     let pending = self.pending.get(id).unwrap()
     let first = @async.with_timeout_opt(self.config.timeout_ms, () => {
       pending.reply.get()
     })
+    self.ensure_open()
     match (qos, first) {
       (@mqtt.QoS1, Some(PubackPacket(_))) => ()
       (@mqtt.QoS2, Some(PubrecPacket(_))) => {
         pending.kind = Pubcomp
+        let flow = self.session.outgoing.get(id).unwrap()
+        flow.stage = WaitPubcomp
+        flow.pubrel_sent = true
         self.send(encoded(@mqtt.encode_pubrel(id)))
         let final_ack = @async.with_timeout_opt(self.config.timeout_ms, () => {
           pending.reply.get()

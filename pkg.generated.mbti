@@ -27,13 +27,13 @@ pub fn MqttError::to_repr(Self) -> @debug.Repr
 // Types and methods
 pub struct Client {
   config : Config
+  session : Session
   tcp : @socket.Tcp
   write_lock : @async.Mutex
   messages : @aqueue.Queue[Message]
   pending : Map[Int, Pending]
-  incoming_qos2 : Map[Int, Bool]
   ping_reply : @aqueue.Queue[Unit]
-  mut next_id : Int
+  mut session_present : Bool
   mut closed : Bool
   mut last_error : Error?
   mut disposed : Bool
@@ -45,6 +45,8 @@ pub async fn[X] Client::connect(Config, @async.TaskGroup[X]) -> Self
 pub async fn Client::disconnect(Self) -> Unit
 pub async fn Client::publish(Self, String, Bytes, qos? : @moonbit-mqtt.QoS, retain? : Bool) -> Unit
 pub async fn Client::receive(Self) -> Message
+pub async fn[X] Client::reconnect(Self, @async.TaskGroup[X]) -> Self
+pub fn Client::session_present(Self) -> Bool
 pub async fn Client::subscribe(Self, String, @moonbit-mqtt.QoS) -> @moonbit-mqtt.QoS
 pub async fn Client::unsubscribe(Self, String) -> Unit
 
@@ -58,6 +60,7 @@ pub(all) struct Config {
   mut timeout_ms : Int
   mut max_packet_size : Int
   mut inbox_capacity : Int
+  mut clean_session : Bool
 }
 pub fn Config::new(String, String, port? : Int) -> Self
 
@@ -69,9 +72,15 @@ pub(all) struct Message {
   dup : Bool
 }
 
+type OutStage
+
+type Outgoing
+
 type Pending
 
 type PendingKind
+
+type Session
 
 // Type aliases
 
