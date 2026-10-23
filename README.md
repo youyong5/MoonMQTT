@@ -69,7 +69,7 @@ config.will = Some(@client.Will::new(
 ))
 ```
 
-遗嘱关联每一条被 broker 接受的网络连接。正常 `disconnect()` 与连接仍可用时的正常 `AutoClient::stop()` 会发送 DISCONNECT，broker 不应发布该连接的遗嘱。`Client::close()` 直接关闭连接；网络故障、进程强制终止及自动重连前的断线都可能触发此前连接的遗嘱。重连只给新连接重新登记遗嘱，不能撤销旧连接的发布。`stop()` 若发送 DISCONNECT 失败、在已发送 CONNECT 但未完成握手期间停止，或此前连接已异常断开，仍清理资源并抛 `DisconnectUncertain`；此时 broker 可能发布遗嘱。TLS 握手尚未完成且 MQTT CONNECT 未发送时，没有遗嘱登记。已写入传输层也不等于应用能证明 broker 收到了 DISCONNECT。
+遗嘱关联每一条被 broker 接受的网络连接。正常 `disconnect()` 与连接仍可用时的 `AutoClient::stop()` 会发送 DISCONNECT；broker 收到后不应发布该连接的遗嘱。`Client::close()` 直接关闭连接；网络故障、进程强制终止及自动重连前的断线都可能触发此前连接的遗嘱。重连只给新连接重新登记遗嘱，不能撤销旧连接的发布。MQTT 3.1.1 没有 DISCONNECT 响应，因此**配置了遗嘱的 `AutoClient::stop()` 即使成功写入 DISCONNECT，也在清理后抛 `DisconnectUncertain`**：库无法证明 broker 已收到它并撤销遗嘱。发送失败、在已发送 CONNECT 但未完成握手期间停止，或此前连接已异常断开时也抛该错误。TLS 握手尚未完成且 MQTT CONNECT 未发送时，没有遗嘱登记。
 
 TLS 保留原有明文默认配置；在连接前设置 `config.tls` 才启用 TLS。默认使用系统可信根，验证证书链和 `config.host`，并用 `config.host` 设置 SNI。私有 CA 使用 PEM 文件，替换系统可信根集合；证书或主机名验证失败报 `TlsValidation`，不会自动无限重试。CA 文件不可读报 `InvalidConfig`。请用证书中的 DNS 名称作为 `host`；端口可设为 broker 的 TLS listener 端口：
 
@@ -120,7 +120,7 @@ config.clean_session = false
 })
 ```
 
-`status()` 返回 `Connecting`、`Connected(session_present)`、`Retrying(连续失败次数, 下次延迟毫秒)`、`Failed` 或 `Stopped`；`last_error()` 可查看最近的连接或终止错误。首次配置或快照读取错误由 `start()` 直接抛出。`wait_connected()` 及自动句柄上的发布、订阅、取消订阅和接收在连接中等待；永久失败时抛出原因，停止后抛 `Closed`。等待可由调用方取消。`stop()` 会停止退避，当前连接可用时先发送 DISCONNECT，再关闭连接并等待后台任务；无法确认已登记遗嘱的连接收到 DISCONNECT 时仍完成清理，抛 `DisconnectUncertain`。任务组取消会直接关闭连接，不保证抑制遗嘱。
+`status()` 返回 `Connecting`、`Connected(session_present)`、`Retrying(连续失败次数, 下次延迟毫秒)`、`Failed` 或 `Stopped`；`last_error()` 可查看最近的连接或终止错误。首次配置或快照读取错误由 `start()` 直接抛出。`wait_connected()` 及自动句柄上的发布、订阅、取消订阅和接收在连接中等待；永久失败时抛出原因，停止后抛 `Closed`。等待可由调用方取消。`stop()` 会停止退避，当前连接可用时先发送 DISCONNECT，再关闭连接并等待后台任务；带遗嘱时因协议没有收件确认，清理后报告 `DisconnectUncertain`，调用方不能据此判断 broker 实际是否发布遗嘱。任务组取消会直接关闭连接，不保证抑制遗嘱。
 
 `AutoClient::publish()`、`subscribe()`、`unsubscribe()` 每次只在选中的连接上调用一次。**调用中途断线时，原调用返回错误，不会作为新请求自动调用第二次**；持久会话仅按 MQTT 协议恢复已登记的 QoS 1/2 在途阶段。调用方不能依据该错误判断 broker 是否收到消息，也不应盲目重发。`receive()` 可跨临时断线继续等待，但已返回消息仍受前述应用层交付边界限制。`clean_session=false` 才能保留在途和订阅状态；若 broker 回 `Session Present=0`，仍按现有规则清理旧在途并重建已确认订阅。未确认的订阅操作不会自动重新发起。
 

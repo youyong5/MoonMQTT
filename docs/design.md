@@ -40,9 +40,9 @@
 
 `AutoClient::start(config, group, policy?)` 返回独立于 TCP 世代的句柄；`status()` 提供 `Connecting`、`Connected(Session Present)`、`Retrying(连续失败次数, 下次延迟毫秒)`、`Failed`、`Stopped`，`last_error()` 提供最近原因。`wait_connected()`、`publish()`、`subscribe()`、`unsubscribe()`、`receive()` 和 `stop()` 都从稳定句柄调用。启动前验证配置并加载快照，因而非法配置或快照读取失败由 `start` 直接返回错误。自动句柄只在当前连接上执行每次应用层 publish/subscribe/unsubscribe；调用中途断线向调用方报错，不透明重调。稳定 `receive()` 在可重试断线后等待下一连接；已返回消息仍遵循原有持久消费边界。
 
-后台 supervisor 持有同一 `Session`，每代连接复用 `connect_with_session`，故 SP1 的原 ID/PUBREL 重发、SP0 清理与重订阅、存储故障封锁均沿用手动模式。正常连接后重置失败次数；网络/握手中断、TCP 连接失败和心跳超时按 `initial_delay_ms`、两倍增长、`max_delay_ms` 上限重试。配置、编解码、认证拒绝、协议、`RecoveryUncertain`、存储、`InboxFull`、`TlsValidation` 为永久错误。`stop()` 先标记停止；若当前连接可用，在请求超时内发送 DISCONNECT，然后关闭连接、取消 supervisor 并等待后台任务。发送失败、超时或连接已断时仍清理资源，但抛 `DisconnectUncertain`，表明 broker 可能发布遗嘱。任务组取消直接关闭连接；连接及退避等待均可取消。其任务组必须覆盖句柄及所有并发操作；同一 Client ID 和快照路径不能另启第二个活动句柄。
+后台 supervisor 持有同一 `Session`，每代连接复用 `connect_with_session`，故 SP1 的原 ID/PUBREL 重发、SP0 清理与重订阅、存储故障封锁均沿用手动模式。正常连接后重置失败次数；网络/握手中断、TCP 连接失败和心跳超时按 `initial_delay_ms`、两倍增长、`max_delay_ms` 上限重试。配置、编解码、认证拒绝、协议、`RecoveryUncertain`、存储、`InboxFull`、`TlsValidation` 为永久错误。`stop()` 先标记停止；若当前连接可用，在请求超时内发送 DISCONNECT，然后关闭连接、取消 supervisor 并等待后台任务。即使写入成功，MQTT 3.1.1 也没有 DISCONNECT 响应；带遗嘱时清理后抛 `DisconnectUncertain`，表明无法确认 broker 是否已撤销遗嘱。任务组取消直接关闭连接；连接及退避等待均可取消。其任务组必须覆盖句柄及所有并发操作；同一 Client ID 和快照路径不能另启第二个活动句柄。
 
-自动重连无法阻止此前连接的遗嘱：前代 TCP 因网络故障关闭时，broker 可能已经发布前代遗嘱；后代 CONNECT 只为新连接登记同一配置。正常停止若 DISCONNECT 只写入本地 TCP、尚未被 broker 收到便断线，也存在遗嘱被发布的可能。`Client::close()` 继续作为直接关闭 TCP 的操作；强制终止进程与任务组取消同样不发送 DISCONNECT。
+自动重连无法阻止此前连接的遗嘱：前代 TCP 因网络故障关闭时，broker 可能已经发布前代遗嘱；后代 CONNECT 只为新连接登记同一配置。正常停止若 DISCONNECT 只写入本地传输层、尚未被 broker 收到便断线，也存在遗嘱被发布的可能；即使本地写入成功，`stop()` 对带遗嘱连接也报告不确定。`Client::close()` 继续作为直接关闭连接的操作；强制终止进程与任务组取消同样不发送 DISCONNECT。
 
 停止竞态使用 MQTT CONNECT 的发送边界记录：supervisor 在发送 CONNECT 前标记本代可能已登记遗嘱；如果连接在 CONNACK 前关闭，或进入退避，且配置了 Will，就保留此前代的不确定性。`stop()` 停止新尝试、在当前连接可用时发 DISCONNECT、取消并等待 supervisor 后，再检查握手标记与此前代记录。即使新连接已正常 DISCONNECT，此前代遗嘱仍可能已发布，故报告 `DisconnectUncertain`。在 TCP/TLS 握手阶段尚未发送 MQTT CONNECT 时停止则无遗嘱风险。模拟 broker 测试覆盖 CONNACK 等待、退避、前代异常断开后本代正常停止、TLS 握手中停止。
 

@@ -178,6 +178,44 @@ async test "failed automatic DISCONNECT still cleans up and reports uncertainty"
 }
 
 ///|
+async test "successful local DISCONNECT write cannot prove Will was discarded" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    group.spawn_bg() <| () => {
+      let (conn, _) = server.accept()
+      assert_true(
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(ConnectPacket(_)),
+      )
+      conn.write(b"\x20\x02\x00\x00")
+      assert_true(
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(DisconnectPacket),
+      )
+      conn.close()
+    }
+    let config = Config::new(
+      "127.0.0.1",
+      "will-clean-stop-result",
+      port=server.addr.port(),
+    )
+    config.keep_alive_seconds = 0
+    config.will = Some(Will::new("test/clean-stop", b"offline"))
+    let auto = AutoClient::start(config, group)
+    auto.wait_connected()
+    assert_true(
+      try {
+        auto.stop()
+        false
+      } catch {
+        DisconnectUncertain => true
+        _ => false
+      },
+    )
+    assert_true(auto.status() is Stopped)
+  }
+}
+
+///|
 async test "stop during CONNACK wait reports possible Will publication" {
   @async.with_task_group() <| group => {
     let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))

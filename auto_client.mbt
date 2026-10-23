@@ -334,6 +334,11 @@ async fn AutoClient::stop_with_disconnect(
             if sent is Err(_) || sent is Ok(None) {
               uncertain = true
             } else {
+              // MQTT 3.1.1 has no DISCONNECT acknowledgement. A local write
+              // cannot prove the broker discarded this connection's Will.
+              if self.config.will is Some(_) {
+                uncertain = true
+              }
               self.will_connect_attempted = false
             }
           }

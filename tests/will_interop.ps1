@@ -62,6 +62,9 @@ try {
     if ($LASTEXITCODE -ne 0 -or $result -notcontains 'READY') {
       throw "Normal $mode failed: $result"
     }
+    if ($mode -eq 'stop' -and $result -notcontains 'WILL_UNCERTAIN') {
+      throw "Normal stop concealed unacknowledged DISCONNECT: $result"
+    }
   }
   Start-Sleep -Milliseconds 300
   if ((Get-Content -Raw $subscriberOutput) -match 'will/(disconnect|stop)') {

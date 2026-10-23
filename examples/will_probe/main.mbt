@@ -51,7 +51,7 @@ async fn main {
         })
         println("AUTO_RECONNECTED")
       }
-      if mode == "auto" {
+      if mode == "auto" || mode == "stop" {
         let uncertain = try {
           client.stop()
           false
