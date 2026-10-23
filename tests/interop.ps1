@@ -28,6 +28,12 @@ try {
   $moonSubscriber = Join-Path $projectRoot '_build\native\debug\build\examples\interop_sub\interop_sub.exe'
   $moonBasic = Join-Path $projectRoot '_build\native\debug\build\examples\basic\basic.exe'
   $moonResume = Join-Path $projectRoot '_build\native\debug\build\examples\session_resume\session_resume.exe'
+  $processResume = Join-Path $projectRoot '_build\native\debug\build\examples\process_resume\process_resume.exe'
+  $processSnapshot = Join-Path $artifactDir 'process-session.bin'
+  $processSeedOutput = Join-Path $artifactDir 'process-seed.txt'
+  $processSeedError = Join-Path $artifactDir 'process-seed.err.log'
+  $processNewOutput = Join-Path $artifactDir 'process-new.txt'
+  $processNewError = Join-Path $artifactDir 'process-new.err.log'
   $resumeOutput = Join-Path $artifactDir 'session-resume.txt'
   $resumeError = Join-Path $artifactDir 'session-resume.err.log'
 
@@ -35,6 +41,8 @@ try {
   $cliProcess = $null
   $moonProcess = $null
   $resumeProcess = $null
+  $processSeed = $null
+  $processNew = $null
   try {
     $brokerProcess = Start-Process -FilePath $brokerExe -ArgumentList @('-p', '1883', '-v') `
       -WindowStyle Hidden -PassThru -RedirectStandardOutput $brokerLog `
@@ -129,10 +137,71 @@ try {
         $resumed -notmatch 'moonmqtt/interop/resume/two: offline QoS2') {
       throw "MoonBit resume example got unexpected data: $resumed $resumeStderr"
     }
-    Write-Output 'PASS: QoS 0/1/2 both ways and same-process persistent-session resume (QoS 1/2)'
+
+    foreach ($path in @($processSnapshot, "$processSnapshot.tmp", "$processSnapshot.ready")) {
+      if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
+    $processSeed = Start-Process -FilePath $processResume -WorkingDirectory $projectRoot `
+      -ArgumentList @('hold', $processSnapshot) -WindowStyle Hidden -PassThru `
+      -RedirectStandardOutput $processSeedOutput -RedirectStandardError $processSeedError
+    $seedReady = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+      if ($processSeed.HasExited) { throw "Process seed exited: $(Get-Content -Raw $processSeedError)" }
+      if (Test-Path -LiteralPath "$processSnapshot.ready") {
+        $seedReady = $true
+        break
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    if (-not $seedReady) { throw 'Process seed did not persist subscriptions' }
+    Stop-Process -Id $processSeed.Id -Force
+    if (-not $processSeed.WaitForExit(5000)) { throw 'Process seed did not stop' }
+    Start-Sleep -Milliseconds 200
+    & $publisherExe -h 127.0.0.1 -p 1883 -t moonmqtt/interop/process/one -q 1 -m 'restart QoS1'
+    if ($LASTEXITCODE -ne 0) { throw 'restart QoS 1 publish failed' }
+    & $publisherExe -h 127.0.0.1 -p 1883 -t moonmqtt/interop/process/two -q 2 -m 'restart QoS2'
+    if ($LASTEXITCODE -ne 0) { throw 'restart QoS 2 publish failed' }
+    $restarted = & $processResume resume $processSnapshot
+    if ($LASTEXITCODE -ne 0 -or $restarted -notcontains 'SESSION_PRESENT=1' -or
+        ($restarted -join "`n") -notmatch 'process/one: restart QoS1' -or
+        ($restarted -join "`n") -notmatch 'process/two: restart QoS2') {
+      throw "Process restart resume failed: $restarted"
+    }
+
+    Stop-Process -Id $brokerProcess.Id -Force
+    if (-not $brokerProcess.WaitForExit(5000)) { throw 'Mosquitto did not stop' }
+    $brokerProcess = Start-Process -FilePath $brokerExe -ArgumentList @('-p', '1883', '-v') `
+      -WindowStyle Hidden -PassThru -RedirectStandardOutput $brokerLog `
+      -RedirectStandardError $brokerError
+    Start-Sleep -Milliseconds 500
+    if ($brokerProcess.HasExited) { throw "Mosquitto restart failed: $(Get-Content -Raw $brokerError)" }
+    $processNew = Start-Process -FilePath $processResume -WorkingDirectory $projectRoot `
+      -ArgumentList @('new', $processSnapshot) -WindowStyle Hidden -PassThru `
+      -RedirectStandardOutput $processNewOutput -RedirectStandardError $processNewError
+    $newReady = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+      if ($processNew.HasExited) { throw "Process new-session example exited: $(Get-Content -Raw $processNewError)" }
+      $brokerText = Get-Content -Raw $brokerError
+      if (([regex]::Matches($brokerText, 'Sending SUBACK to moonmqtt-interop-process-resume')).Count -ge 2) {
+        $newReady = $true
+        break
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    if (-not $newReady) { throw 'Process new-session example did not resubscribe' }
+    & $publisherExe -h 127.0.0.1 -p 1883 -t moonmqtt/interop/process/one -q 1 -m 'after broker reset'
+    if ($LASTEXITCODE -ne 0) { throw 'post-reset publish failed' }
+    if (-not $processNew.WaitForExit(10000)) { throw 'Process new-session example timed out' }
+    $newResult = Get-Content -Raw $processNewOutput
+    $newError = Get-Content -Raw $processNewError
+    if ($newError -or $newResult -notmatch 'SESSION_PRESENT=0' -or
+        $newResult -notmatch 'process/one: after broker reset') {
+      throw "Process new-session example failed: $newResult $newError"
+    }
+    Write-Output 'PASS: QoS 0/1/2 both ways, in-process resume, process restart (SP=1), broker reset (SP=0)'
   }
   finally {
-    foreach ($childProcess in @($resumeProcess, $moonProcess, $cliProcess, $brokerProcess)) {
+    foreach ($childProcess in @($processNew, $processSeed, $resumeProcess, $moonProcess, $cliProcess, $brokerProcess)) {
       if ($null -ne $childProcess -and -not $childProcess.HasExited) {
         Stop-Process -Id $childProcess.Id -Force
       }
