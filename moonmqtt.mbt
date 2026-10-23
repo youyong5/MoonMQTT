@@ -11,6 +11,7 @@ pub(all) struct Config {
   mut max_packet_size : Int32
   mut inbox_capacity : Int32
   mut clean_session : Bool
+  mut session_store : SessionStore?
 }
 
 ///|
@@ -30,6 +31,7 @@ pub fn Config::new(
     max_packet_size: 1024 * 1024,
     inbox_capacity: 256,
     clean_session: true,
+    session_store: None,
   }
 }
 
@@ -51,13 +53,18 @@ pub suberror MqttError {
   Closed
   TimedOut
   InboxFull
+  Storage(String)
+  CorruptSession(String)
+  IncompatibleSessionVersion(Int32)
+  SessionClientIdMismatch(String)
+  RecoveryUncertain
 } derive(Debug)
 
 ///|
 pub extend MqttError with @debug.Debug::{to_repr}
 
 ///|
-enum PendingKind {
+priv enum PendingKind {
   Puback
   Suback
   Unsuback
@@ -73,14 +80,14 @@ struct Pending {
 }
 
 ///|
-enum OutStage {
+priv enum OutStage {
   WaitPuback
   WaitPubrec
   WaitPubcomp
 }
 
 ///|
-struct Outgoing {
+priv struct Outgoing {
   topic : String
   payload : Bytes
   qos : @mqtt.QoS
@@ -92,6 +99,8 @@ struct Outgoing {
 ///|
 struct Session {
   client_id : String
+  store : SessionStore?
+  persist_lock : @async.Mutex
   mut next_id : Int32
   outgoing : Map[Int32, Outgoing]
   mut order : Array[Int32]
@@ -99,13 +108,19 @@ struct Session {
   subscriptions : Map[String, @mqtt.QoS]
   mut backlog : Array[Message]
   mut ever_connected : Bool
+  mut connecting : Bool
+  mut resubscribe_needed : Bool
+  mut loaded_uncertain : Bool
+  mut storage_failed : Bool
   mut active : Bool
 }
 
 ///|
-fn Session::new(client_id : String) -> Session {
+fn Session::new(client_id : String, store : SessionStore?) -> Session {
   {
     client_id,
+    store,
+    persist_lock: @async.Mutex::Mutex(),
     next_id: 1,
     outgoing: Map([]),
     order: [],
@@ -113,6 +128,10 @@ fn Session::new(client_id : String) -> Session {
     subscriptions: Map([]),
     backlog: [],
     ever_connected: false,
+    connecting: false,
+    resubscribe_needed: false,
+    loaded_uncertain: false,
+    storage_failed: false,
     active: false,
   }
 }
@@ -135,6 +154,7 @@ pub struct Client {
   session : Session
   tcp : @socket.Tcp
   write_lock : @async.Mutex
+  receive_lock : @async.Mutex
   messages : @async.Queue[Message]
   pending : Map[Int32, Pending]
   ping_reply : @async.Queue[Unit]
@@ -173,6 +193,9 @@ fn validate(config : Config) -> Unit raise MqttError {
   if config.password is Some(_) && config.username is None {
     raise InvalidConfig("password requires username")
   }
+  if config.clean_session && config.session_store is Some(_) {
+    raise InvalidConfig("session store requires clean_session=false")
+  }
 }
 
 ///|
@@ -181,6 +204,24 @@ fn Client::ensure_open(self : Client) -> Unit raise {
     match self.last_error {
       Some(e) => raise e
       None => raise Closed
+    }
+  }
+}
+
+///|
+async fn Client::save_session(self : Client) -> Unit {
+  errdefer self.finish(Closed)
+  let saved : Result[Unit, Error] = try {
+    self.session.persist()
+    Ok(())
+  } catch {
+    e => Err(e)
+  }
+  match saved {
+    Ok(_) => self.ensure_open()
+    Err(e) => {
+      self.finish(e)
+      raise e
     }
   }
 }
@@ -199,7 +240,7 @@ fn Client::finish(self : Client, reason : Error) -> Unit {
       Some(task) => task.cancel()
       None => ()
     }
-    if !self.config.clean_session {
+    if !self.config.clean_session && self.session.store is None {
       while true {
         let next = self.messages.try_get() catch { _ => None }
         match next {
@@ -409,18 +450,34 @@ async fn Client::reader(self : Client) -> Unit {
           false
         }
         if !duplicate_qos2 {
-          let accepted = self.messages.try_put({
+          let message = {
             topic: publish.topic,
             payload: publish.payload,
             qos: publish.qos,
             retain: publish.retain,
             dup: publish.dup,
-          }) catch {
-            _ => false
           }
+          let durable = self.session.store is Some(_)
+          if durable {
+            if self.session.backlog.length() >= self.config.inbox_capacity {
+              self.finish(InboxFull)
+              return
+            }
+            self.session.backlog.push(message)
+            if publish.qos == @mqtt.QoS2 {
+              self.session.incoming_qos2[id.unwrap()] = false
+            }
+            self.save_session() catch {
+              _ => return
+            }
+          }
+          let accepted = self.messages.try_put(message) catch { _ => false }
           if !accepted {
             self.finish(InboxFull)
             return
+          }
+          if !durable && publish.qos == @mqtt.QoS2 {
+            self.session.incoming_qos2[id.unwrap()] = false
           }
         }
         try {
@@ -433,12 +490,7 @@ async fn Client::reader(self : Client) -> Unit {
               }
             @mqtt.QoS2 =>
               match id {
-                Some(id) => {
-                  if !duplicate_qos2 {
-                    self.session.incoming_qos2[id] = false
-                  }
-                  self.send(encoded(@mqtt.encode_pubrec(id)))
-                }
+                Some(id) => self.send(encoded(@mqtt.encode_pubrec(id)))
                 None => raise Protocol("QoS 2 PUBLISH has no ID")
               }
           }
@@ -453,6 +505,9 @@ async fn Client::reader(self : Client) -> Unit {
         match self.session.outgoing.get(id.message_id) {
           Some(flow) if flow.stage is WaitPuback => {
             self.session.forget_outgoing(id.message_id)
+            self.save_session() catch {
+              _ => return
+            }
             if self.pending.contains(id.message_id) {
               self.resolve(id.message_id, packet)
             }
@@ -463,6 +518,9 @@ async fn Client::reader(self : Client) -> Unit {
         match self.session.outgoing.get(id.message_id) {
           Some(flow) if flow.stage is WaitPubrec => {
             flow.stage = WaitPubcomp
+            self.save_session() catch {
+              _ => return
+            }
             if self.pending.contains(id.message_id) {
               self.resolve(id.message_id, packet)
             } else {
@@ -489,8 +547,11 @@ async fn Client::reader(self : Client) -> Unit {
         }
       PubcompPacket(id) =>
         match self.session.outgoing.get(id.message_id) {
-          Some(flow) if flow.stage is WaitPubcomp => {
+          Some(flow) if flow.stage is WaitPubcomp && flow.pubrel_sent => {
             self.session.forget_outgoing(id.message_id)
+            self.save_session() catch {
+              _ => return
+            }
             if self.pending.contains(id.message_id) {
               self.resolve(id.message_id, packet)
             }
@@ -501,6 +562,9 @@ async fn Client::reader(self : Client) -> Unit {
         match self.session.incoming_qos2.get(id.message_id) {
           Some(_) => {
             self.session.incoming_qos2[id.message_id] = true
+            self.save_session() catch {
+              _ => return
+            }
             self.send(encoded(@mqtt.encode_pubcomp(id.message_id))) catch {
               e => {
                 self.finish(e)
@@ -602,7 +666,20 @@ pub async fn[X] Client::connect(
   config : Config,
   group : @async.TaskGroup[X],
 ) -> Client {
-  connect_with_session(config, Session::new(config.client_id), group)
+  validate(config)
+  let session = match config.session_store {
+    None => Session::new(config.client_id, None)
+    Some(store) => {
+      let loaded = (store.load_data)() catch {
+        _ => raise Storage("session store read failed")
+      }
+      match loaded {
+        None => Session::new(config.client_id, Some(store))
+        Some(data) => decode_session(data, config.client_id, store)
+      }
+    }
+  }
+  connect_with_session(config, session, group)
 }
 
 ///|
@@ -615,6 +692,11 @@ pub async fn[X] Client::reconnect(
     raise InvalidConfig("reconnect requires clean_session=false")
   }
   self.close()
+  if self.session.storage_failed {
+    raise Storage(
+      "storage failed; create a new Client from the durable snapshot",
+    )
+  }
   connect_with_session(self.config, self.session, group)
 }
 
@@ -653,6 +735,7 @@ async fn[X] connect_with_session(
     session,
     tcp,
     write_lock: @async.Mutex::Mutex(),
+    receive_lock: @async.Mutex::Mutex(),
     messages: @async.Queue::Queue(kind=Blocking(config.inbox_capacity)),
     pending: Map([]),
     ping_reply: @async.Queue::Queue(kind=DiscardOldest(1)),
@@ -665,6 +748,10 @@ async fn[X] connect_with_session(
   }
   tcp_owned_by_client = true
   errdefer @async.protect_from_cancel(() => client.close())
+  if !config.clean_session && session.store is Some(_) {
+    session.connecting = true
+    client.save_session()
+  }
   let flags = @mqtt.ConnectFlags::{
     username: config.username is Some(_),
     password: config.password is Some(_),
@@ -704,6 +791,13 @@ async fn[X] connect_with_session(
             "server session exists but local session state is unavailable",
           )
         }
+        if !config.clean_session &&
+          session.connecting &&
+          ack.session_present &&
+          session.store is Some(_) &&
+          session.loaded_uncertain {
+          raise RecoveryUncertain
+        }
         Ok(ack.session_present)
       }
       Ok(_) => raise Protocol("expected CONNACK")
@@ -722,10 +816,11 @@ async fn[X] connect_with_session(
             client.close()
             raise InboxFull
           }
-          let backlog = session.backlog
-          session.backlog = []
-          for message in backlog {
+          for message in session.backlog {
             let _ = client.messages.try_put(message) catch { _ => false }
+          }
+          if session.store is None {
+            session.backlog = []
           }
         } else {
           session.outgoing.clear()
@@ -733,9 +828,15 @@ async fn[X] connect_with_session(
           session.incoming_qos2.clear()
           session.backlog = []
           session.next_id = 1
+          session.resubscribe_needed = !session.subscriptions.is_empty()
         }
       }
       session.ever_connected = true
+      if !config.clean_session && session.store is Some(_) {
+        session.connecting = false
+        client.save_session()
+        session.loaded_uncertain = false
+      }
     }
     Err(e) => raise e
   }
@@ -751,13 +852,18 @@ async fn[X] connect_with_session(
     if !config.clean_session {
       if client.session_present {
         client.replay_outgoing()
-      } else {
+      }
+      if !client.session_present || session.resubscribe_needed {
         let filters : Array[(String, @mqtt.QoS)] = []
         for filter, qos in session.subscriptions {
           filters.push((filter, qos))
         }
         for (filter, qos) in filters {
           let _ = client.subscribe(filter, qos)
+        }
+        if session.resubscribe_needed {
+          session.resubscribe_needed = false
+          client.save_session()
         }
       }
     }
@@ -794,7 +900,18 @@ pub async fn[X] with_client(config : Config, f : async (Client) -> X) -> X {
 ///|
 /// Receive the next publication or raise the terminal connection error.
 pub async fn Client::receive(self : Client) -> Message {
-  self.messages.get()
+  self.receive_lock.acquire()
+  defer self.receive_lock.release()
+  let message = self.messages.get()
+  if self.session.store is Some(_) {
+    if self.session.backlog.is_empty() {
+      self.finish(CorruptSession("message queue and snapshot diverged"))
+      raise CorruptSession("message queue and snapshot diverged")
+    }
+    let _ = self.session.backlog.remove(0)
+    self.save_session()
+  }
+  message
 }
 
 ///|
@@ -809,6 +926,7 @@ async fn Client::request(
   defer (if !completed { self.finish(Closed) })
   let result : Result[@mqtt.Packet, Error] = try {
     let bytes = encoded(make_bytes(id))
+    self.save_session()
     self.send(bytes)
     let pending = self.pending.get(id).unwrap()
     match
@@ -857,6 +975,7 @@ pub async fn Client::subscribe(
   }
   // Restore the requested maximum QoS, not a broker's previous grant.
   self.session.subscriptions[filter] = qos
+  self.save_session()
   granted
 }
 
@@ -867,7 +986,10 @@ pub async fn Client::unsubscribe(self : Client, filter : String) -> Unit {
     self.request(Unsuback, id => {
       @mqtt.encode_unsubscribe({ message_id: id, topics: [filter], })
     }) {
-    UnsubackPacket(_) => self.session.subscriptions.remove(filter)
+    UnsubackPacket(_) => {
+      self.session.subscriptions.remove(filter)
+      self.save_session()
+    }
     _ => raise Protocol("expected matching UNSUBACK")
   }
 }
@@ -926,6 +1048,7 @@ pub async fn Client::publish(
       pubrel_sent: false,
     }
     self.session.order.push(id)
+    self.save_session()
     self.send(bytes)
     let pending = self.pending.get(id).unwrap()
     let first = @async.with_timeout_opt(self.config.timeout_ms, () => {

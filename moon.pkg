@@ -1,6 +1,8 @@
 import {
   "moonbitlang/async",
   "moonbitlang/async/socket",
+  "moonbitlang/async/fs",
+  "moonbitlang/core/encoding/utf8",
   "zbhzs1/moonbit-mqtt" @mqtt,
   "moonbitlang/core/debug",
 }

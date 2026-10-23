@@ -21,6 +21,11 @@ pub suberror MqttError {
   Closed
   TimedOut
   InboxFull
+  Storage(String)
+  CorruptSession(String)
+  IncompatibleSessionVersion(Int)
+  SessionClientIdMismatch(String)
+  RecoveryUncertain
 } derive(@debug.Debug)
 pub fn MqttError::to_repr(Self) -> @debug.Repr
 
@@ -30,6 +35,7 @@ pub struct Client {
   session : Session
   tcp : @socket.Tcp
   write_lock : @async.Mutex
+  receive_lock : @async.Mutex
   messages : @aqueue.Queue[Message]
   pending : Map[Int, Pending]
   ping_reply : @aqueue.Queue[Unit]
@@ -61,6 +67,7 @@ pub(all) struct Config {
   mut max_packet_size : Int
   mut inbox_capacity : Int
   mut clean_session : Bool
+  mut session_store : SessionStore?
 }
 pub fn Config::new(String, String, port? : Int) -> Self
 
@@ -72,15 +79,16 @@ pub(all) struct Message {
   dup : Bool
 }
 
-type OutStage
-
-type Outgoing
-
 type Pending
 
-type PendingKind
-
 type Session
+
+pub struct SessionStore {
+  load_data : async () -> Bytes?
+  save_data : async (Bytes) -> Unit
+}
+pub fn SessionStore::file(String) -> Self
+pub fn SessionStore::new(async () -> Bytes?, async (Bytes) -> Unit) -> Self
 
 // Type aliases
 
