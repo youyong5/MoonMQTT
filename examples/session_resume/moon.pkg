@@ -1,0 +1,9 @@
+import {
+  "youyong5/moonmqtt" @client,
+  "moonbitlang/async",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/encoding/utf8",
+  "zbhzs1/moonbit-mqtt" @packet,
+}
+
+pkgtype(kind: "executable")

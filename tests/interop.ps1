@@ -27,10 +27,14 @@ try {
   $moonPublisher = Join-Path $projectRoot '_build\native\debug\build\examples\interop_pub\interop_pub.exe'
   $moonSubscriber = Join-Path $projectRoot '_build\native\debug\build\examples\interop_sub\interop_sub.exe'
   $moonBasic = Join-Path $projectRoot '_build\native\debug\build\examples\basic\basic.exe'
+  $moonResume = Join-Path $projectRoot '_build\native\debug\build\examples\session_resume\session_resume.exe'
+  $resumeOutput = Join-Path $artifactDir 'session-resume.txt'
+  $resumeError = Join-Path $artifactDir 'session-resume.err.log'
 
   $brokerProcess = $null
   $cliProcess = $null
   $moonProcess = $null
+  $resumeProcess = $null
   try {
     $brokerProcess = Start-Process -FilePath $brokerExe -ArgumentList @('-p', '1883', '-v') `
       -WindowStyle Hidden -PassThru -RedirectStandardOutput $brokerLog `
@@ -86,10 +90,49 @@ try {
         $moonOutput -notmatch 'moonmqtt/interop/in2: from Mosquitto QoS2') {
       throw "MoonBit subscriber got unexpected data: $(Get-Content -Raw $moonMessage)"
     }
-    Write-Output 'PASS: basic example and two-way MoonBit/Mosquitto CLI exchange (QoS 0, 1 and 2)'
+
+    $resumeProcess = Start-Process -FilePath $moonResume -WorkingDirectory $projectRoot `
+      -WindowStyle Hidden -PassThru -RedirectStandardOutput $resumeOutput `
+      -RedirectStandardError $resumeError
+    $offline = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+      if ($resumeProcess.HasExited) { throw "MoonBit resume example exited: $(Get-Content -Raw $resumeError)" }
+      $brokerText = Get-Content -Raw $brokerError
+      if ($brokerText -match 'Client moonmqtt-interop-resume disconnected') {
+        $offline = $true
+        break
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    if (-not $offline) { throw 'MoonBit resume example did not become ready' }
+    & $publisherExe -h 127.0.0.1 -p 1883 -t moonmqtt/interop/resume/one -q 1 -m 'offline QoS1'
+    if ($LASTEXITCODE -ne 0) { throw 'offline QoS 1 publish failed' }
+    & $publisherExe -h 127.0.0.1 -p 1883 -t moonmqtt/interop/resume/two -q 2 -m 'offline QoS2'
+    if ($LASTEXITCODE -ne 0) { throw 'offline QoS 2 publish failed' }
+    $control = $null
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+      try {
+        $control = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 18884)
+        break
+      } catch {
+        if ($resumeProcess.HasExited) { throw "MoonBit resume example exited: $(Get-Content -Raw $resumeError)" }
+        Start-Sleep -Milliseconds 100
+      }
+    }
+    if ($null -eq $control) { throw 'MoonBit resume control socket unavailable' }
+    try { $control.GetStream().WriteByte(1) } finally { $control.Dispose() }
+    if (-not $resumeProcess.WaitForExit(10000)) { throw 'MoonBit resume example timed out' }
+    $resumed = Get-Content -Raw $resumeOutput
+    $resumeStderr = Get-Content -Raw $resumeError
+    if ($resumeStderr -or
+        $resumed -notmatch 'moonmqtt/interop/resume/one: offline QoS1' -or
+        $resumed -notmatch 'moonmqtt/interop/resume/two: offline QoS2') {
+      throw "MoonBit resume example got unexpected data: $resumed $resumeStderr"
+    }
+    Write-Output 'PASS: QoS 0/1/2 both ways and same-process persistent-session resume (QoS 1/2)'
   }
   finally {
-    foreach ($childProcess in @($moonProcess, $cliProcess, $brokerProcess)) {
+    foreach ($childProcess in @($resumeProcess, $moonProcess, $cliProcess, $brokerProcess)) {
       if ($null -ne $childProcess -and -not $childProcess.HasExited) {
         Stop-Process -Id $childProcess.Id -Force
       }

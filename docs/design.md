@@ -1,40 +1,40 @@
-# MoonMQTT 设计记录（第二阶段）
+# MoonMQTT 设计记录（第三阶段）
 
-## 依据与依赖
+## 协议依据与依赖
 
-- [OASIS MQTT 3.1.1 标准](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html) §4.3.2、§4.3.3、§4.4：QoS 1 等待 PUBACK；QoS 2 发送方在 PUBREC 后发送 PUBREL，PUBCOMP 后才能复用 ID；接收方对 PUBREL 回 PUBCOMP，对 PUBREL 前重复 PUBLISH 回 PUBREC 且不能再次交付。§4.4 要求 `CleanSession=0` 重连时重发未确认的 PUBLISH 或 PUBREL；本库固定 clean session，不实现该跨连接恢复。
-- [`moonbitlang/async` 0.22.5](https://mooncakes.io/docs/moonbitlang/async)：使用 `Tcp::connect_to_host`、`read_exactly`、`write`、`close`，一个连接只有一个读任务。TLS 包具有 `Tls::client`，但本阶段仍只使用明文 TCP。
-- [`zbhzs1/moonbit-mqtt` 0.1.0](https://mooncakes.io/docs/zbhzs1/moonbit-mqtt)：已公开 QoS 2 的 `encode_pubrec/pubrel/pubcomp`、解码和 `Packet` 变体，足以继续复用为编解码依赖。本库保留其 QoS 类型作为公开 API 的参数/字段类型，不复制报文编码。其 `packet_total_length` 不能区分不完整缓冲与非法报文，因此本库独立按固定头 Remaining Length 读取完整帧，再交给 codec 解码。
+- [OASIS MQTT 3.1.1](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html) §3.1.2.4、§3.2.2.2：`CleanSession=0` 时会话以稳定 Client ID 标识；CONNACK `Session Present` 表明 broker 是否保留旧会话。客户端会话状态包括未完全确认的出站 QoS 1/2 和未完全确认的入站 QoS 2；broker 会话另包含订阅。`Session Present=0` 代表新会话。
+- 同一规范 §4.3.3、§4.4、§4.6：出站 QoS 2 收到 PUBREC 后只能重发 PUBREL；重连且 `CleanSession=0` 时按原 ID 重发未确认的 PUBLISH 或 PUBREL；重发 PUBLISH 保持原始顺序并设置 DUP。PUBREL 固定头保留位仍为 `0x62`。
+- `moonbitlang/async` 0.22.5 提供 TCP、任务组、队列、互斥锁和超时；`zbhzs1/moonbit-mqtt` 0.1.0 提供 MQTT 报文编解码。codec 的 `packet_total_length` 不能区分不完整缓冲与非法报文，因此本库先读取固定头和 Remaining Length 指定的完整帧，再交给 codec。TLS 包存在，但尚未接入本库。
 
-现有 codec 仅处理报文，不提供网络连接、异步任务、请求匹配、消息队列、超时、QoS 握手状态、会话或重连。MoonMQTT 实现这些客户端行为。
-
-## 结构和公开 API
+## 代码结构和公开 API
 
 | 路径 | 用途 |
 | --- | --- |
-| `moonmqtt.mbt` | 配置、客户端 API、TCP 帧读取、请求表、QoS 1/2 握手、心跳、关闭 |
-| `moonmqtt_wbtest.mbt` | 第一阶段及回归模拟 broker 测试 |
-| `qos2_wbtest.mbt` | 并发、取消、队列与 QoS 2 状态测试 |
-| `examples/basic` | 最小库调用 |
-| `examples/interop_pub`、`examples/interop_sub` | Mosquitto CLI 双向互通端点 |
-| `tests/interop.ps1` | 自动启动 broker，执行 QoS 0/1/2 互通 |
+| `moonmqtt.mbt` | 客户端 API、TCP 帧读取、连接任务、请求/会话状态、QoS 1/2 恢复 |
+| `moonmqtt_wbtest.mbt` | 初始连接及流式读写回归 |
+| `qos2_wbtest.mbt` | QoS 2 双向握手、重复 PUBREC、取消、错误报文 |
+| `session_wbtest.mbt` | 会话重连、各阶段断线、订阅恢复、在途 ID 与顺序 |
+| `examples/basic`、`examples/session_resume` | 最小单连接使用、同进程续接示例 |
+| `examples/interop_pub`、`examples/interop_sub`、`tests/interop.ps1` | Mosquitto CLI 双向互通和真实会话续接 |
 
-`Config::new(host, client_id, port?)` 后可设置用户名、密码、Keep Alive、请求超时、报文上限和接收队列容量。`Client::connect(config, group)` 完成 CONNACK 后生成读任务与心跳任务。`with_client(config, callback)` 自动管理任务组并调用正常断开/异常关闭。`subscribe(filter, qos)` 返回授予的 QoS；`unsubscribe(filter)` 等待 UNSUBACK；`publish(topic, payload, qos?, retain?)` 对 QoS 0 等待 TCP 写入、QoS 1 等待 PUBACK、QoS 2 等待 PUBCOMP；`receive()` 获取下一条消息。`disconnect()` 发送 DISCONNECT 并关闭，`close()` 不发送 DISCONNECT，二者均可在终止后清理资源。
+`Config::new(host, client_id, port?)` 后可配置 `clean_session`（默认 `true`）、用户名/密码、Keep Alive、超时、报文上限和接收队列容量。`Client::connect(config, group)` 建立 TCP 并完成 CONNECT/CONNACK。`Client::session_present()` 返回本次 CONNACK 的状态；持久会话由旧 `Client::reconnect(group)` 显式创建下一代连接，仍使用原客户端 ID 和同一内存会话。不能对 clean session 调用 `reconnect`，也不能让同一会话同时连接两条 TCP。
 
-`MqttError` 为 `InvalidConfig`、`Codec`、`Protocol`、`Rejected`、`Closed`、`TimedOut`、`InboxFull`。底层 socket 错误和取消可能直接向调用方传播。连接关闭时消息队列、心跳队列与所有待处理请求一起关闭，等待者被唤醒；调用方应在任务组退出前调用 `close()` 或 `disconnect()` 以等待后台任务并关闭 socket。
+`subscribe(filter, qos)` 返回授予的 QoS，`unsubscribe(filter)` 等待 UNSUBACK；`publish(topic, payload, qos?, retain?)` 对 QoS 0 等待 TCP 写入、QoS 1 等待 PUBACK、QoS 2 等待 PUBCOMP；`receive()` 取下一条消息。`disconnect()` 发送 DISCONNECT 并关 TCP，`close()` 直接关 TCP。二者均等待后台读/心跳任务。`with_client` 管理单次连接的任务组；显式重连应自行管理任务组及每一代 `Client`。错误包括 `InvalidConfig`、`Codec`、`Protocol`、`Rejected`、`Closed`、`TimedOut`、`InboxFull`，底层 socket 错误及取消可能直接传播。
 
-## 请求与状态
+## 同进程会话状态
 
-客户端在同步的 `reserve()` 中选取 1–65535 范围内未使用的 ID，并立即放入待处理表。并发 `publish`、`subscribe`、`unsubscribe` 因此不能拿到相同 ID。每条待处理请求记录期望确认类型；未知 ID、类型不符或错误顺序是协议错误，终止当前连接。成功确认后释放 ID。超时、任务取消、写失败或异常断开会终止连接并清理整张表，防止旧确认命中同连接后复用的 ID。每个 `Client` 独占其 TCP、读任务和待处理表，新连接不会读取旧 socket。
+每个初始 `Client` 拥有一份 `Session`；重连的新 `Client` 复用它。会话记录稳定 Client ID、下一个报文 ID、出站在途消息及原始发送顺序、入站 QoS 2 去重状态、已确认的订阅，以及旧连接尚未被 `receive()` 消费的消息。每代 `Client` 独占 TCP、读/心跳任务、响应队列和临时请求表。旧连接关闭时清空临时表并唤醒等待者；持久会话的出站和入站状态留在 `Session` 中。旧 socket 的迟到响应无法进入新连接的临时表。
 
-发送 QoS 2 状态：`PUBLISH → AwaitPUBREC → PUBREL → AwaitPUBCOMP → done`。收到重复 PUBREC 时只再发 PUBREL，绝不在 PUBREL 后重发 PUBLISH；仅 PUBCOMP 使 ID 可用。当前连接内没有定时重发；等确认超时则关闭连接。按 §4.4，持久会话重连才要求按原 ID 重发未确认的 PUBLISH/PUBREL；持久会话尚未实现，故无跨连接恢复。
+新报文 ID 在同步 `reserve()` 中立即进入临时表，分配时同时跳过会话里未确认的出站 ID。收到 PUBACK 或 PUBCOMP 才从会话删除对应消息并释放 ID。超时、取消、写失败、异常断开使当前连接终止；持久会话保留已登记的 QoS 1/2 在途消息，clean session 则清除。旧 `publish` 调用仍报错；随后恢复的确认不会回填到原调用，目前没有逐条跨连接完成通知。已确认的订阅记在会话中；尚未得到 SUBACK/UNSUBACK 的操作结果不确定，调用方应重试。
 
-接收 QoS 2 使用标准图 4.3 的 Method B：首次 PUBLISH 成功入队并记录 ID 后发 PUBREC；到 PUBREL 前重复 PUBLISH 仅重发 PUBREC；PUBREL 后标记完成并发 PUBCOMP；重复 PUBREL 仍发 PUBCOMP。后续相同 ID 的 PUBLISH 被视作新消息，包括 DUP 位为 1 的情况。完成 ID 的标记最多覆盖 65535 个编号，随连接终止清除。对未知 ID 的 PUBREL 仍返回 PUBCOMP，遵循标准对 PUBREL 的无条件确认要求。QoS 1 每个已成功入队的 PUBLISH 都单独 PUBACK；标准允许相同 ID 在 PUBACK 后代表新消息。
+若重连 CONNACK 的 `Session Present=1`，本库在返回新客户端前按原顺序重发出站在途报文：等待 PUBACK/PUBREC 的消息发送原 ID 且 `DUP=1` 的 PUBLISH；已经收到 PUBREC 的消息仅重发原 ID 的 PUBREL。之后 broker 的确认会清理该在途状态。连续重复 PUBREC 在首次 PUBREL 写出前合并；PUBREL 已尝试发送后收到重复 PUBREC，则再次发送 PUBREL。测试同步注入两个 PUBREC，确保发布任务处理首个确认前不会将第二个留在确认队列中。
 
-接收队列使用可配置的有界 `Blocking(capacity)`，读任务以 `try_put` 非阻塞入队。如果队列满，发出 `InboxFull` 并终止连接，且不确认当前 QoS 1/2 消息，避免读任务卡住后无法处理其他确认报文。应用若已收到 QoS 1/2 的成功确认但尚未消费入队消息，随后发生断线，则消息仍可能丢失：队列和去重表不持久化。QoS 0 则没有协议确认。
+若 `Session Present=0`，broker 已无旧会话，本库清除旧出站在途、入站去重和未消费消息，并对已确认的订阅自动重发 SUBSCRIBE。旧在途发布是否曾被 broker 或下游处理无法再判定。首次创建本地持久会话时若 broker 却返回 `Session Present=1`，本库拒绝连接：进程内缺少必要的客户端 QoS 状态，不能安全宣称恢复。若需要丢弃 broker 旧会话，应用应使用 clean session 建立新会话。
 
-TCP 是字节流；`read_packet` 读取 1 字节固定头、1–4 字节 Remaining Length、再读取精确正文长度，限制最大报文。它不会将一次 `read` 视作一包。`write_lock` 串行化完整报文写入；心跳与业务请求共用该锁。
+入站 QoS 2 使用标准图 4.3 的 Method B：首次 PUBLISH 成功入队并记 ID 后回 PUBREC；PUBREL 前同 ID 的 PUBLISH 只回 PUBREC，不重复交付；PUBREL 后回 PUBCOMP，重复 PUBREL 仍回 PUBCOMP。完成后同 ID 的新 PUBLISH 即使 `DUP=1` 也视为新消息。持久会话断线时保留去重状态及未消费队列，`Session Present=0` 时清除。对未知 ID 的 PUBREL 仍回复 PUBCOMP。QoS 1 已成功入队后回 PUBACK；同 ID 后续 PUBLISH 视为新消息。
 
-## 尚未实现
+接收队列是可配置的有界队列，读任务用 `try_put` 非阻塞入队。队列满时发出 `InboxFull` 并终止当前连接，不确认当前 QoS 1/2 报文，避免读任务卡住而无法处理其他确认。TCP 是字节流；`read_packet` 按 1 字节固定头、1–4 字节 Remaining Length 和精确正文长度读取，支持分片与合包。`write_lock` 串行化报文写入。
 
-下一阶段按此顺序：1. 持久会话与本地状态存储，恢复 QoS 1/2 的 PUBLISH/PUBREL；2. 自动重连与退避，并验证旧连接隔离和恢复顺序；3. 遗嘱消息及其配置和测试；4. TLS 传输、证书验证与真实 broker 互通。此后再考虑 WebSocket、MQTT 5 和更细的流控策略。
+## 范围边界
+
+本阶段仅支持**同进程跨 TCP 连接恢复**。没有磁盘状态保存；进程退出后，出站在途与入站 QoS 2 去重状态消失。没有自动重连、跨连接逐条完成回调、遗嘱消息、TLS、WebSocket 或 MQTT 5。后续顺序：先实现磁盘状态保存及崩溃恢复，再实现自动重连与退避，之后支持遗嘱消息，最后接入 TLS 与证书验证。
