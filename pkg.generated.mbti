@@ -30,6 +30,36 @@ pub suberror MqttError {
 pub fn MqttError::to_repr(Self) -> @debug.Repr
 
 // Types and methods
+pub struct AutoClient {
+  config : Config
+  policy : ReconnectPolicy
+  session : Session
+  mut current : Client?
+  mut status : AutoStatus
+  mut last_error : Error?
+  mut stopped : Bool
+  mut task : @async.Task[Unit]?
+  receive_lock : @async.Mutex
+}
+pub fn AutoClient::last_error(Self) -> Error?
+pub async fn AutoClient::publish(Self, String, Bytes, qos? : @moonbit-mqtt.QoS, retain? : Bool) -> Unit
+pub async fn AutoClient::receive(Self) -> Message
+pub async fn[X] AutoClient::start(Config, @async.TaskGroup[X], policy? : ReconnectPolicy) -> Self
+pub fn AutoClient::status(Self) -> AutoStatus
+pub async fn AutoClient::stop(Self) -> Unit
+pub async fn AutoClient::subscribe(Self, String, @moonbit-mqtt.QoS) -> @moonbit-mqtt.QoS
+pub async fn AutoClient::unsubscribe(Self, String) -> Unit
+pub async fn AutoClient::wait_connected(Self) -> Unit
+
+pub(all) enum AutoStatus {
+  Connecting
+  Connected(Bool)
+  Retrying(Int, Int)
+  Failed
+  Stopped
+} derive(@debug.Debug)
+pub fn AutoStatus::to_repr(Self) -> @debug.Repr
+
 pub struct Client {
   config : Config
   session : Session
@@ -80,6 +110,12 @@ pub(all) struct Message {
 }
 
 type Pending
+
+pub(all) struct ReconnectPolicy {
+  initial_delay_ms : Int
+  max_delay_ms : Int
+}
+pub fn ReconnectPolicy::new(initial_delay_ms? : Int, max_delay_ms? : Int) -> Self
 
 type Session
 

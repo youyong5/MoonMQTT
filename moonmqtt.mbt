@@ -668,7 +668,12 @@ pub async fn[X] Client::connect(
   group : @async.TaskGroup[X],
 ) -> Client {
   validate(config)
-  let session = match config.session_store {
+  connect_with_session(config, load_session(config), group)
+}
+
+///|
+async fn load_session(config : Config) -> Session {
+  match config.session_store {
     None => Session::new(config.client_id, None)
     Some(store) => {
       let loaded = (store.load_data)() catch {
@@ -680,7 +685,6 @@ pub async fn[X] Client::connect(
       }
     }
   }
-  connect_with_session(config, session, group)
 }
 
 ///|

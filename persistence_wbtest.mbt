@@ -819,6 +819,7 @@ async test "old stored client reconnects after close with QoS 1 and inbound QoS 
     let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
     defer server.close()
     let ready : @async.Queue[Int32] = @async.Queue::Queue(kind=Blocking(1))
+    let completed : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
     let inbound = encoded(
       @mqtt.encode_publish({
         topic: "test/in",
@@ -903,6 +904,7 @@ async test "old stored client reconnects after close with QoS 1 and inbound QoS 
       assert_true(
         @mqtt.decode_packet(read_packet(second, 4096)) is Ok(PubcompPacket(_)),
       )
+      completed.put(())
       assert_true(
         @mqtt.decode_packet(read_packet(second, 4096)) is Ok(DisconnectPacket),
       )
@@ -940,6 +942,7 @@ async test "old stored client reconnects after close with QoS 1 and inbound QoS 
     })
     assert_true(second.session.backlog.is_empty())
     assert_true(second.session.subscriptions.contains("test/#"))
+    @async.with_timeout(1000, () => completed.get())
     second.disconnect()
   }
 }
@@ -951,6 +954,7 @@ async test "old stored client reconnects after drop in QoS 2 PUBREL stage" {
     let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
     defer server.close()
     let sent : @async.Queue[Int32] = @async.Queue::Queue(kind=Blocking(1))
+    let completed : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
     group.spawn_bg() <| () => {
       let (first, _) = server.accept()
       let _ = read_packet(first, 4096)
@@ -1036,6 +1040,7 @@ async test "old stored client reconnects after drop in QoS 2 PUBREL stage" {
       assert_true(
         @mqtt.decode_packet(read_packet(second, 4096)) is Ok(PubcompPacket(_)),
       )
+      completed.put(())
       assert_true(
         @mqtt.decode_packet(read_packet(second, 4096)) is Ok(DisconnectPacket),
       )
@@ -1077,6 +1082,7 @@ async test "old stored client reconnects after drop in QoS 2 PUBREL stage" {
       }
     })
     assert_true(second.session.subscriptions.contains("test/#"))
+    @async.with_timeout(1000, () => completed.get())
     second.disconnect()
   }
 }
