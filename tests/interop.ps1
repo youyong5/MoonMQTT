@@ -28,6 +28,9 @@ try {
   $moonSubscriber = Join-Path $projectRoot '_build\native\debug\build\examples\interop_sub\interop_sub.exe'
   $moonBasic = Join-Path $projectRoot '_build\native\debug\build\examples\basic\basic.exe'
   $moonResume = Join-Path $projectRoot '_build\native\debug\build\examples\session_resume\session_resume.exe'
+  $autoResume = Join-Path $projectRoot '_build\native\debug\build\examples\auto_resume\auto_resume.exe'
+  $autoOutput = Join-Path $artifactDir 'auto-resume.txt'
+  $autoError = Join-Path $artifactDir 'auto-resume.err.log'
   $processResume = Join-Path $projectRoot '_build\native\debug\build\examples\process_resume\process_resume.exe'
   $processSnapshot = Join-Path $artifactDir 'process-session.bin'
   $processSeedOutput = Join-Path $artifactDir 'process-seed.txt'
@@ -41,6 +44,7 @@ try {
   $cliProcess = $null
   $moonProcess = $null
   $resumeProcess = $null
+  $autoProcess = $null
   $processSeed = $null
   $processNew = $null
   try {
@@ -168,6 +172,20 @@ try {
       throw "Process restart resume failed: $restarted"
     }
 
+    $autoProcess = Start-Process -FilePath $autoResume -WorkingDirectory $projectRoot `
+      -WindowStyle Hidden -PassThru -RedirectStandardOutput $autoOutput `
+      -RedirectStandardError $autoError
+    $autoReady = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+      if ($autoProcess.HasExited) { throw "Auto client exited: $(Get-Content -Raw $autoError)" }
+      if ((Get-Content -Raw $brokerError) -match 'Sending SUBACK to moonmqtt-interop-auto') {
+        $autoReady = $true
+        break
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    if (-not $autoReady) { throw 'Auto client did not subscribe before restart' }
+
     Stop-Process -Id $brokerProcess.Id -Force
     if (-not $brokerProcess.WaitForExit(5000)) { throw 'Mosquitto did not stop' }
     $brokerProcess = Start-Process -FilePath $brokerExe -ArgumentList @('-p', '1883', '-v') `
@@ -175,6 +193,25 @@ try {
       -RedirectStandardError $brokerError
     Start-Sleep -Milliseconds 500
     if ($brokerProcess.HasExited) { throw "Mosquitto restart failed: $(Get-Content -Raw $brokerError)" }
+    $autoResubscribed = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+      if ($autoProcess.HasExited) { throw "Auto client exited during restart: $(Get-Content -Raw $autoError)" }
+      if ((Get-Content -Raw $brokerError) -match 'Sending SUBACK to moonmqtt-interop-auto') {
+        $autoResubscribed = $true
+        break
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    if (-not $autoResubscribed) { throw 'Auto client did not reconnect and resubscribe' }
+    & $publisherExe -h 127.0.0.1 -p 1883 -t moonmqtt/interop/auto -q 1 -m 'after broker restart'
+    if ($LASTEXITCODE -ne 0) { throw 'post-restart auto publish failed' }
+    if (-not $autoProcess.WaitForExit(10000)) { throw 'Auto client did not receive after restart' }
+    $autoResult = Get-Content -Raw $autoOutput
+    if ((Get-Content -Raw $autoError) -or
+        $autoResult -notmatch 'AUTO_READY' -or
+        $autoResult -notmatch 'AUTO_RECEIVED=moonmqtt/interop/auto: after broker restart') {
+      throw "Auto client broker restart failed: $autoResult $(Get-Content -Raw $autoError)"
+    }
     $processNew = Start-Process -FilePath $processResume -WorkingDirectory $projectRoot `
       -ArgumentList @('new', $processSnapshot) -WindowStyle Hidden -PassThru `
       -RedirectStandardOutput $processNewOutput -RedirectStandardError $processNewError
@@ -198,10 +235,10 @@ try {
         $newResult -notmatch 'process/one: after broker reset') {
       throw "Process new-session example failed: $newResult $newError"
     }
-    Write-Output 'PASS: QoS 0/1/2 both ways, in-process resume, process restart (SP=1), broker reset (SP=0)'
+    Write-Output 'PASS: QoS 0/1/2 both ways, in-process resume, process restart (SP=1), auto broker restart and resubscribe (SP=0)'
   }
   finally {
-    foreach ($childProcess in @($processNew, $processSeed, $resumeProcess, $moonProcess, $cliProcess, $brokerProcess)) {
+    foreach ($childProcess in @($processNew, $processSeed, $autoProcess, $resumeProcess, $moonProcess, $cliProcess, $brokerProcess)) {
       if ($null -ne $childProcess -and -not $childProcess.HasExited) {
         Stop-Process -Id $childProcess.Id -Force
       }

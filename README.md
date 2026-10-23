@@ -4,7 +4,7 @@
 
 ## 能力矩阵
 
-| 能力 | 第四阶段状态 |
+| 能力 | 当前状态 |
 | --- | --- |
 | CONNECT/CONNACK、拒绝原因、用户名/密码、clean session | 已支持；`clean_session` 默认 `true`，可设为 `false`；公开 `session_present()` |
 | SUBSCRIBE/SUBACK、UNSUBSCRIBE/UNSUBACK | 已支持；每次一个过滤器，订阅可请求 QoS 0/1/2 |
@@ -14,7 +14,8 @@
 | 心跳、正常断开 | PINGREQ/PINGRESP、DISCONNECT 已支持 |
 | 流式读取 | 支持 TCP 分片与合包、最大报文限制 |
 | 待处理请求与队列 | 报文 ID 预留、响应类型/ID 检查、超时和取消清理；接收队列有容量上限 |
-| 同进程持久会话与显式重连 | `clean_session=false` 时保留 QoS 1/2 在途状态及入站 QoS 2 去重；按原 ID 重发未确认的 PUBLISH 或 PUBREL；不自动重连 |
+| 同进程持久会话与显式重连 | `clean_session=false` 时保留 QoS 1/2 在途状态及入站 QoS 2 去重；按原 ID 重发未确认的 PUBLISH 或 PUBREL |
+| 可选自动重连 | `AutoClient` 稳定句柄；连接中、已连接、重试中、永久失败和停止状态；临时故障使用有上限指数退避，支持停止与取消 |
 | native 进程重启恢复 | 可选 `SessionStore`；保存出站 QoS 1/2 阶段及原 ID、入站 QoS 2 状态和未消费消息；支持文件存储或应用自定义存储 |
 | 遗嘱消息、TLS、WebSocket、MQTT 5 | 未实现 |
 
@@ -52,7 +53,7 @@ async fn main {
 }
 ```
 
-`Config::new` 默认端口 1883、Keep Alive 30 秒、请求超时 5 秒、最大报文 1 MiB。连接前也可设置 `username`、`password`、`keep_alive_seconds`、`timeout_ms`、`max_packet_size`。连接后不要修改配置。
+`Config::new` 默认端口 1883、Keep Alive 30 秒、请求超时 5 秒、最大报文 1 MiB。连接前也可设置 `username`、`password`、`keep_alive_seconds`、`timeout_ms`、`max_packet_size`。调用 `Client::connect` 或 `AutoClient::start` 后不要修改配置。
 
 `with_client` 创建任务组并在正常返回时发送 DISCONNECT；回调抛错时关闭 TCP。手动使用 `Client::connect(config, group)` 时，任务组须覆盖所有客户端操作，并最终调用异步 `disconnect()` 或 `close()`。`receive()` 一直等待下一条消息或终止错误，可由调用方用 `@async.with_timeout` 限时。
 
@@ -74,6 +75,30 @@ config.clean_session = false
 ```
 
 完整的同进程离线收消息示例见 [`examples/session_resume`](examples/session_resume/main.mbt)。`with_client` 适合单次连接；需要显式续接时请手动管理任务组和每一代 `Client`。
+
+自动模式使用稳定的 `AutoClient` 句柄；原有 `Client::connect`、`reconnect(group)` 和手动管理方式仍可使用：
+
+```moonbit
+let config = @client.Config::new("127.0.0.1", "stable-auto-id")
+config.clean_session = false
+@async.with_task_group(group => {
+  let client = @client.AutoClient::start(
+    config, group,
+    policy=@client.ReconnectPolicy::new(initial_delay_ms=100, max_delay_ms=5000),
+  )
+  client.wait_connected()
+  let _ = client.subscribe("demo/#", @packet.QoS1)
+  let message = client.receive() // 可跨临时断线继续等待
+  println(message.topic)
+  client.stop()
+})
+```
+
+`status()` 返回 `Connecting`、`Connected(session_present)`、`Retrying(连续失败次数, 下次延迟毫秒)`、`Failed` 或 `Stopped`；`last_error()` 可查看最近的连接或终止错误。首次配置或快照读取错误由 `start()` 直接抛出。`wait_connected()` 及自动句柄上的发布、订阅、取消订阅和接收在连接中等待；永久失败时抛出原因，停止后抛 `Closed`。等待可由调用方取消，`stop()` 会取消退避、关闭当前连接并等待后台任务。任务组取消也会关闭连接。自动句柄的 `stop()` 直接关闭 TCP，不发送 DISCONNECT；需要正常 DISCONNECT 时继续使用手动 `Client` API。
+
+`AutoClient::publish()`、`subscribe()`、`unsubscribe()` 每次只在选中的连接上调用一次。**调用中途断线时，原调用返回错误，不会作为新请求自动调用第二次**；持久会话仅按 MQTT 协议恢复已登记的 QoS 1/2 在途阶段。调用方不能依据该错误判断 broker 是否收到消息，也不应盲目重发。`receive()` 可跨临时断线继续等待，但已返回消息仍受前述应用层交付边界限制。`clean_session=false` 才能保留在途和订阅状态；若 broker 回 `Session Present=0`，仍按现有规则清理旧在途并重建已确认订阅。未确认的订阅操作不会自动重新发起。
+
+退避从 `initial_delay_ms` 开始，每次失败翻倍，最高 `max_delay_ms`；成功连接后重置。网络断开、连接失败和心跳超时会重试；配置、编解码、认证拒绝、协议、`RecoveryUncertain`、存储和 `InboxFull` 错误进入 `Failed`，不会无限重试。完整示例见 [`examples/auto_resume`](examples/auto_resume/main.mbt)。
 
 跨进程恢复使用同一 Client ID、同一快照路径，并在每个进程中重新创建配置：
 
@@ -109,7 +134,7 @@ moon test --target native
 moon run examples/basic --target native
 ```
 
-端到端测试需要 Mosquitto broker 及 `mosquitto_pub`、`mosquitto_sub`。脚本自行启动和关闭本地 broker，验证 MoonBit 与 CLI 双向 QoS 0/1/2、同进程续接、独立进程重启时的 `Session Present=1`，以及 broker 重置后的 `Session Present=0` 与订阅重建：
+端到端测试需要 Mosquitto broker 及 `mosquitto_pub`、`mosquitto_sub`。脚本自行启动和关闭本地 broker，验证 MoonBit 与 CLI 双向 QoS 0/1/2、同进程续接、独立进程重启时的 `Session Present=1`，以及自动句柄在 broker 重启后的重连、`Session Present=0` 与订阅重建：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\interop.ps1
@@ -117,4 +142,4 @@ powershell -ExecutionPolicy Bypass -File tests\interop.ps1
 powershell -ExecutionPolicy Bypass -File tests\interop.ps1 -MosquittoDirectory 'D:\path\to\mosquitto\bin'
 ```
 
-本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出、QoS 2 连续重复 PUBREC、旧 `Client` 在主动关闭和异常断线后的同进程恢复、关闭与异步保存交错、跨进程 QoS 1/2 重发、损坏快照、存储故障前不发送确认、以及持久会话两种 `Session Present` 结果。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。
+本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出、QoS 2 连续重复 PUBREC、旧 `Client` 在主动关闭和异常断线后的同进程恢复、关闭与异步保存交错、跨进程 QoS 1/2 重发、损坏快照、存储故障前不发送确认、持久会话两种 `Session Present` 结果，以及自动模式的退避上限、停止/取消、QoS 1/2 在途恢复、订阅重建和永久错误。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。

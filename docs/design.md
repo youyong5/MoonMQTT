@@ -1,4 +1,4 @@
-# MoonMQTT 设计记录（第四阶段）
+# MoonMQTT 设计记录（自动重连阶段）
 
 ## 协议依据与依赖
 
@@ -11,18 +11,25 @@
 | 路径 | 用途 |
 | --- | --- |
 | `moonmqtt.mbt` | 客户端 API、TCP 帧读取、连接任务、请求/会话状态、QoS 1/2 恢复 |
+| `auto_client.mbt` | 稳定自动句柄、状态、可取消指数退避与错误分类 |
 | `session_store.mbt` | 版本化会话快照、校验与验证、可替换存储接口和 native 文件存储 |
 | `moonmqtt_wbtest.mbt` | 初始连接及流式读写回归 |
 | `qos2_wbtest.mbt` | QoS 2 双向握手、重复 PUBREC、取消、错误报文 |
 | `session_wbtest.mbt` | 会话重连、各阶段断线、订阅恢复、在途 ID 与顺序 |
 | `persistence_wbtest.mbt` | 文件快照、损坏检测、进程级重建和存储故障断点 |
+| `auto_wbtest.mbt` | 模拟 broker 自动恢复、退避、停止/取消及永久错误 |
 | `examples/basic`、`examples/session_resume` | 最小单连接使用、同进程续接示例 |
 | `examples/process_resume` | 独立 native 进程共享快照路径的恢复示例 |
+| `examples/auto_resume` | 稳定自动句柄及 broker 重启后的订阅恢复示例 |
 | `examples/interop_pub`、`examples/interop_sub`、`tests/interop.ps1` | Mosquitto CLI 双向互通和真实会话续接 |
 
 `Config::new(host, client_id, port?)` 后可配置 `clean_session`（默认 `true`）、用户名/密码、Keep Alive、超时、报文上限和接收队列容量。`clean_session=false` 时可设置 `config.session_store = Some(SessionStore::file(path))`，也可用 `SessionStore::new(load, save)` 接入应用存储。`Client::connect(config, group)` 先读取并校验快照，再建立 TCP 和完成 CONNECT/CONNACK；无快照时才创建新本地会话。`Client::session_present()` 返回本次 CONNACK 状态。旧 `Client::reconnect(group)` 沿用同进程内存会话；进程重启则以相同 Client ID 和存储重新调用 `Client::connect`。不能对 clean session 配置存储或调用 `reconnect`，同一会话也不能同时连接两条 TCP。
 
 `subscribe(filter, qos)` 返回授予的 QoS，`unsubscribe(filter)` 等待 UNSUBACK；`publish(topic, payload, qos?, retain?)` 对 QoS 0 等待 TCP 写入、QoS 1 等待 PUBACK、QoS 2 等待 PUBCOMP；`receive()` 取下一条消息。`disconnect()` 发送 DISCONNECT 并关 TCP，`close()` 直接关 TCP。二者均等待后台读/心跳任务。`with_client` 管理单次连接的任务组；显式重连应自行管理任务组及每一代 `Client`。公开存储错误为 `Storage`、`CorruptSession`、`IncompatibleSessionVersion`、`SessionClientIdMismatch`、`RecoveryUncertain`；其他连接错误仍包括 `InvalidConfig`、`Codec`、`Protocol`、`Rejected`、`Closed`、`TimedOut`、`InboxFull`。底层 socket 错误及取消可能直接传播。
+
+`AutoClient::start(config, group, policy?)` 返回独立于 TCP 世代的句柄；`status()` 提供 `Connecting`、`Connected(Session Present)`、`Retrying(连续失败次数, 下次延迟毫秒)`、`Failed`、`Stopped`，`last_error()` 提供最近原因。`wait_connected()`、`publish()`、`subscribe()`、`unsubscribe()`、`receive()` 和 `stop()` 都从稳定句柄调用。启动前验证配置并加载快照，因而非法配置或快照读取失败由 `start` 直接返回错误。自动句柄只在当前连接上执行每次应用层 publish/subscribe/unsubscribe；调用中途断线向调用方报错，不透明重调。稳定 `receive()` 在可重试断线后等待下一连接；已返回消息仍遵循原有持久消费边界。
+
+后台 supervisor 持有同一 `Session`，每代连接复用 `connect_with_session`，故 SP1 的原 ID/PUBREL 重发、SP0 清理与重订阅、存储故障封锁均沿用手动模式。正常连接后重置失败次数；网络/握手中断、TCP 连接失败和心跳超时按 `initial_delay_ms`、两倍增长、`max_delay_ms` 上限重试。配置、编解码、认证拒绝、协议、`RecoveryUncertain`、存储、`InboxFull` 为永久错误。`stop()` 先标记停止，关闭当前连接并取消 supervisor；任务组取消时由取消处理器清理连接。连接及退避等待均可取消。自动模式使用 `close()`，因此停止时不发送 DISCONNECT。其任务组必须覆盖句柄及所有并发操作；同一 Client ID 和快照路径不能另启第二个活动句柄。
 
 ## 同进程会话状态
 
@@ -60,4 +67,4 @@ SP0 清理时还持久记录“待重订阅”；只有所有已确认过滤器�
 
 ## 范围边界
 
-本阶段支持 native 平台的**同进程续接和可选的跨进程快照恢复**。没有自动重连、跨连接逐条完成回调、应用消息处理事务、遗嘱消息、TLS、WebSocket 或 MQTT 5。后续可依次加入自动重连与退避、遗嘱消息、TLS 与证书验证。
+本阶段支持 native 平台的**手动或可选自动同进程续接，以及可选的跨进程快照恢复**。没有跨连接逐条完成回调、应用消息处理事务、遗嘱消息、TLS、WebSocket 或 MQTT 5。后续可依次加入遗嘱消息、TLS 与证书验证。
