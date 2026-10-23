@@ -1,6 +1,6 @@
 # MoonMQTT
 
-`youyong5/moonmqtt` 是供其他 MoonBit 程序调用的 MQTT 3.1.1 客户端库。当前使用 `moonbitlang/async` 的原生 TCP 与 TLS，使用 `zbhzs1/moonbit-mqtt` 编解码 MQTT 报文。目标平台为 MoonBit **native**；明文 TCP 与 MQTT over TLS 均可配置。尚未发布到 Mooncakes。
+`youyong5/moonmqtt` 是供其他 MoonBit 程序调用的 MQTT 3.1.1 客户端库。当前使用 `moonbitlang/async` 的原生 TCP 与 TLS，使用 `zbhzs1/moonbit-mqtt` 编解码 MQTT 报文。目标平台为 MoonBit **native**；明文 TCP 与 MQTT over TLS 均可配置。
 
 ## 能力矩阵
 
@@ -31,7 +31,15 @@
 
 ## 最小示例
 
-库在本仓库内可直接运行 `examples/basic`。其他 MoonBit 项目在本模块发布 Mooncakes 版本后可添加依赖；目前可通过 Git 源码集成。`moon.pkg` 需要导入本库、`moonbitlang/async` 和 `zbhzs1/moonbit-mqtt`：
+库在[本仓库的 `examples/basic`](https://github.com/youyong5/MoonMQTT/tree/main/examples/basic) 中有可运行示例。其他 MoonBit 项目先添加依赖：
+
+```powershell
+moon add youyong5/moonmqtt@0.1.0
+moon add moonbitlang/async@0.22.5
+moon add zbhzs1/moonbit-mqtt@0.1.0
+```
+
+然后在 `moon.pkg` 导入本库、`moonbitlang/async` 和 `zbhzs1/moonbit-mqtt`：
 
 ```moonbit
 import {
@@ -100,7 +108,7 @@ config.clean_session = false
 })
 ```
 
-完整的同进程离线收消息示例见 [`examples/session_resume`](examples/session_resume/main.mbt)。`with_client` 适合单次连接；需要显式续接时请手动管理任务组和每一代 `Client`。
+完整的同进程离线收消息示例见[仓库中的 `examples/session_resume`](https://github.com/youyong5/MoonMQTT/blob/main/examples/session_resume/main.mbt)。`with_client` 适合单次连接；需要显式续接时请手动管理任务组和每一代 `Client`。
 
 自动模式使用稳定的 `AutoClient` 句柄；原有 `Client::connect`、`reconnect(group)` 和手动管理方式仍可使用：
 
@@ -136,7 +144,7 @@ try {
 
 `AutoClient::publish()`、`subscribe()`、`unsubscribe()` 每次只在选中的连接上调用一次。**调用中途断线时，原调用返回错误，不会作为新请求自动调用第二次**；持久会话仅按 MQTT 协议恢复已登记的 QoS 1/2 在途阶段。调用方不能依据该错误判断 broker 是否收到消息，也不应盲目重发。`receive()` 可跨临时断线继续等待，但已返回消息仍受前述应用层交付边界限制。`clean_session=false` 才能保留在途和订阅状态；若 broker 回 `Session Present=0`，仍按现有规则清理旧在途并重建已确认订阅。未确认的订阅操作不会自动重新发起。
 
-退避从 `initial_delay_ms` 开始，每次失败翻倍，最高 `max_delay_ms`；成功连接后重置。网络断开、连接失败和心跳超时会重试；配置、编解码、认证拒绝、协议、`RecoveryUncertain`、存储和 `InboxFull` 错误进入 `Failed`，不会无限重试。完整示例见 [`examples/auto_resume`](examples/auto_resume/main.mbt)。
+退避从 `initial_delay_ms` 开始，每次失败翻倍，最高 `max_delay_ms`；成功连接后重置。网络断开、连接失败和心跳超时会重试；配置、编解码、认证拒绝、协议、`RecoveryUncertain`、存储和 `InboxFull` 错误进入 `Failed`，不会无限重试。完整示例见[仓库中的 `examples/auto_resume`](https://github.com/youyong5/MoonMQTT/blob/main/examples/auto_resume/main.mbt)。
 
 跨进程恢复使用同一 Client ID、同一快照路径，并在每个进程中重新创建配置：
 
@@ -152,7 +160,7 @@ config.session_store = Some(@client.SessionStore::file("./mqtt-session.bin"))
 })
 ```
 
-完整的分进程示例见 [`examples/process_resume`](examples/process_resume/main.mbt)，运行 `moon run --target native examples/process_resume seed .\mqtt-session.bin`，在另一进程以 `resume` 模式使用同一路径。一个快照文件只允许一个活动客户端进程使用。文件快照格式版本为 3，限 64 MiB；写入临时文件、同步后替换旧文件。`SessionStore::new(load, save)` 可接入应用存储；`load` 仅在没有快照时返回 `None`，`save` 必须完整、原子且持久地替换旧快照。文件实现针对**进程退出/崩溃**恢复；未承诺断电时目录项也已落盘。
+完整的分进程示例见[仓库中的 `examples/process_resume`](https://github.com/youyong5/MoonMQTT/blob/main/examples/process_resume/main.mbt)，运行 `moon run --target native examples/process_resume seed .\mqtt-session.bin`，在另一进程以 `resume` 模式使用同一路径。一个快照文件只允许一个活动客户端进程使用。文件快照格式版本为 3，限 64 MiB；写入临时文件、同步后替换旧文件。`SessionStore::new(load, save)` 可接入应用存储；`load` 仅在没有快照时返回 `None`，`save` 必须完整、原子且持久地替换旧快照。文件实现针对**进程退出/崩溃**恢复；未承诺断电时目录项也已落盘。
 
 损坏快照、未知版本、Client ID 不一致分别报 `CorruptSession`、`IncompatibleSessionVersion`、`SessionClientIdMismatch`，不会当成新会话。`Storage` 表示读写失败；一次写失败后旧 `Client` 不能直接 `reconnect()`，应先排除故障，再用 `Client::connect()` 从持久快照重建。连接尝试中若进程崩溃，或 broker 会话重置的本地记录未能保存，快照会保留不确定标记；下次 `Session Present=1` 报 `RecoveryUncertain`，`Session Present=0` 可安全清理旧状态。若必须放弃不确定旧会话，先以同一 ID 建立 clean session 连接清除 broker 状态，再删除快照并建立新持久会话；此操作会丢弃旧会话消息。
 
