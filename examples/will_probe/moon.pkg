@@ -1,0 +1,10 @@
+import {
+  "youyong5/moonmqtt" @client,
+  "moonbitlang/async",
+  "moonbitlang/core/argparse",
+  "zbhzs1/moonbit-mqtt" @packet,
+}
+
+supported_targets = "+native"
+
+pkgtype(kind: "executable")

@@ -17,7 +17,8 @@
 | 同进程持久会话与显式重连 | `clean_session=false` 时保留 QoS 1/2 在途状态及入站 QoS 2 去重；按原 ID 重发未确认的 PUBLISH 或 PUBREL |
 | 可选自动重连 | `AutoClient` 稳定句柄；连接中、已连接、重试中、永久失败和停止状态；临时故障使用有上限指数退避，支持停止与取消 |
 | native 进程重启恢复 | 可选 `SessionStore`；保存出站 QoS 1/2 阶段及原 ID、入站 QoS 2 状态和未消费消息；支持文件存储或应用自定义存储 |
-| 遗嘱消息、TLS、WebSocket、MQTT 5 | 未实现 |
+| MQTT 3.1.1 遗嘱 | 可配置主题、二进制负载、QoS 0/1/2 和 retain；每代自动重连的 CONNECT 都重新携带遗嘱 |
+| TLS、WebSocket、MQTT 5 | 未实现 |
 
 接收队列默认容纳 256 条消息，可在连接前设置 `config.inbox_capacity`。队列满时客户端报 `InboxFull` 并终止连接；QoS 1/2 消息只有成功入队后才确认。应用须持续调用 `receive()`。`clean_session=false` 时，同一进程内可使用旧 `Client` 调用 `reconnect()`；进程重启后则以同一 Client ID 和快照路径调用 `Client::connect()`。收到 `Session Present=1` 后按协议恢复。若 broker 回 `Session Present=0`，本地旧在途与去重状态会清除，并自动重新订阅已确认的过滤器。若无本地快照却收到 `Session Present=1`，连接会报协议错误。
 
@@ -54,6 +55,20 @@ async fn main {
 ```
 
 `Config::new` 默认端口 1883、Keep Alive 30 秒、请求超时 5 秒、最大报文 1 MiB。连接前也可设置 `username`、`password`、`keep_alive_seconds`、`timeout_ms`、`max_packet_size`。调用 `Client::connect` 或 `AutoClient::start` 后不要修改配置。
+
+配置遗嘱时，负载按字节发送，可以包含零字节；主题须是有效的 MQTT 主题名（不能为空或包含 `+`、`#`），负载最多 65535 字节。非法配置在连接前抛 `InvalidConfig`：
+
+```moonbit
+let config = @client.Config::new("127.0.0.1", "stable-client-id")
+config.will = Some(@client.Will::new(
+  "devices/alpha/status",
+  Bytes::from_array([0x00, 0xff, 0x41]),
+  qos=@packet.QoS2,
+  retain=true,
+))
+```
+
+遗嘱关联每一条被 broker 接受的网络连接。正常 `disconnect()` 与连接仍可用时的正常 `AutoClient::stop()` 会发送 DISCONNECT，broker 不应发布该连接的遗嘱。`Client::close()` 直接关闭 TCP；网络故障、进程强制终止及自动重连前的断线都可能触发此前连接的遗嘱。重连只给新连接重新登记遗嘱，不能撤销旧连接的发布。`stop()` 若发送 DISCONNECT 失败或当前连接已经断开，仍清理资源并抛 `DisconnectUncertain`；此时 broker 可能发布遗嘱。已写入 TCP 也不等于应用能证明 broker 收到了 DISCONNECT。
 
 `with_client` 创建任务组并在正常返回时发送 DISCONNECT；回调抛错时关闭 TCP。手动使用 `Client::connect(config, group)` 时，任务组须覆盖所有客户端操作，并最终调用异步 `disconnect()` 或 `close()`。`receive()` 一直等待下一条消息或终止错误，可由调用方用 `@async.with_timeout` 限时。
 
@@ -94,7 +109,7 @@ config.clean_session = false
 })
 ```
 
-`status()` 返回 `Connecting`、`Connected(session_present)`、`Retrying(连续失败次数, 下次延迟毫秒)`、`Failed` 或 `Stopped`；`last_error()` 可查看最近的连接或终止错误。首次配置或快照读取错误由 `start()` 直接抛出。`wait_connected()` 及自动句柄上的发布、订阅、取消订阅和接收在连接中等待；永久失败时抛出原因，停止后抛 `Closed`。等待可由调用方取消，`stop()` 会取消退避、关闭当前连接并等待后台任务。任务组取消也会关闭连接。自动句柄的 `stop()` 直接关闭 TCP，不发送 DISCONNECT；需要正常 DISCONNECT 时继续使用手动 `Client` API。
+`status()` 返回 `Connecting`、`Connected(session_present)`、`Retrying(连续失败次数, 下次延迟毫秒)`、`Failed` 或 `Stopped`；`last_error()` 可查看最近的连接或终止错误。首次配置或快照读取错误由 `start()` 直接抛出。`wait_connected()` 及自动句柄上的发布、订阅、取消订阅和接收在连接中等待；永久失败时抛出原因，停止后抛 `Closed`。等待可由调用方取消。`stop()` 会停止退避，当前连接可用时先发送 DISCONNECT，再关闭连接并等待后台任务；发送失败仍完成清理，抛 `DisconnectUncertain`。任务组取消会直接关闭连接，不保证抑制遗嘱。
 
 `AutoClient::publish()`、`subscribe()`、`unsubscribe()` 每次只在选中的连接上调用一次。**调用中途断线时，原调用返回错误，不会作为新请求自动调用第二次**；持久会话仅按 MQTT 协议恢复已登记的 QoS 1/2 在途阶段。调用方不能依据该错误判断 broker 是否收到消息，也不应盲目重发。`receive()` 可跨临时断线继续等待，但已返回消息仍受前述应用层交付边界限制。`clean_session=false` 才能保留在途和订阅状态；若 broker 回 `Session Present=0`，仍按现有规则清理旧在途并重建已确认订阅。未确认的订阅操作不会自动重新发起。
 
@@ -120,7 +135,7 @@ config.session_store = Some(@client.SessionStore::file("./mqtt-session.bin"))
 
 broker 回 `Session Present=0` 后，已确认的订阅会自动重建。若重建途中进程退出，快照会保留待重订阅标记；下次即使 broker 回 1，也会继续重订阅。重复 SUBSCRIBE 可能使 retained 消息再次到达。
 
-公开错误 `MqttError` 另包括 `InvalidConfig`、`Codec`、`Protocol`、`Rejected`、`Closed`、`TimedOut` 和 `InboxFull`。底层 socket 错误及取消也可能传播。`publish` 的 QoS 1/2 成功只表示协议确认完成，不表示订阅方已处理消息。
+公开错误 `MqttError` 另包括 `InvalidConfig`、`Codec`、`Protocol`、`Rejected`、`Closed`、`TimedOut`、`InboxFull` 和 `DisconnectUncertain`。底层 socket 错误及取消也可能传播。`publish` 的 QoS 1/2 成功只表示协议确认完成，不表示订阅方已处理消息。
 
 ## 运行和测试
 
@@ -134,7 +149,7 @@ moon test --target native
 moon run examples/basic --target native
 ```
 
-端到端测试需要 Mosquitto broker 及 `mosquitto_pub`、`mosquitto_sub`。脚本自行启动和关闭本地 broker，验证 MoonBit 与 CLI 双向 QoS 0/1/2、同进程续接、独立进程重启时的 `Session Present=1`，以及自动句柄在 broker 重启后的重连、`Session Present=0` 与订阅重建：
+端到端测试需要 Mosquitto broker 及 `mosquitto_pub`、`mosquitto_sub`。脚本自行启动和关闭本地 broker，验证 MoonBit 与 CLI 双向 QoS 0/1/2、同进程续接、独立进程重启时的 `Session Present=1`，以及自动句柄在 broker 重启后的重连、`Session Present=0` 与订阅重建。还验证 QoS 0/1/2 遗嘱、retain、正常 DISCONNECT/stop、直接 close、强制终止和自动重连前的遗嘱发布：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\interop.ps1
@@ -142,4 +157,4 @@ powershell -ExecutionPolicy Bypass -File tests\interop.ps1
 powershell -ExecutionPolicy Bypass -File tests\interop.ps1 -MosquittoDirectory 'D:\path\to\mosquitto\bin'
 ```
 
-本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出、QoS 2 连续重复 PUBREC、旧 `Client` 在主动关闭和异常断线后的同进程恢复、关闭与异步保存交错、跨进程 QoS 1/2 重发、损坏快照、存储故障前不发送确认、持久会话两种 `Session Present` 结果，以及自动模式的退避上限、停止/取消、QoS 1/2 在途恢复、订阅重建和永久错误。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。
+本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出、QoS 2 连续重复 PUBREC、旧 `Client` 在主动关闭和异常断线后的同进程恢复、关闭与异步保存交错、跨进程 QoS 1/2 重发、损坏快照、存储故障前不发送确认、持久会话两种 `Session Present` 结果，以及自动模式的退避上限、停止/取消、QoS 1/2 在途恢复、订阅重建和永久错误。遗嘱测试检查非法配置、CONNECT 字段、每代重连携带相同遗嘱，以及 DISCONNECT 发送失败时的清理。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。
