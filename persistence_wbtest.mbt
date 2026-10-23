@@ -811,3 +811,360 @@ async test "failed SP0 reset checkpoint cannot revive stale flows on SP1" {
     assert_true(refused)
   }
 }
+
+///|
+async test "old stored client reconnects after close with QoS 1 and inbound QoS 2" {
+  @async.with_task_group() <| group => {
+    let (store, state) = fault_store()
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    let ready : @async.Queue[Int32] = @async.Queue::Queue(kind=Blocking(1))
+    let inbound = encoded(
+      @mqtt.encode_publish({
+        topic: "test/in",
+        payload: b"once",
+        qos: @mqtt.QoS2,
+        message_id: Some(77),
+        retain: false,
+        dup: false,
+      }),
+    )
+    group.spawn_bg() <| () => {
+      let (first, _) = server.accept()
+      let _ = read_packet(first, 4096)
+      first.write(b"\x20\x02\x00\x00")
+      let sub_id = match @mqtt.decode_packet(read_packet(first, 4096)) {
+        Ok(SubscribePacket(p)) => p.message_id
+        _ => abort("expected SUBSCRIBE")
+      }
+      first.write(
+        Bytes::from_array(
+          encoded(
+            @mqtt.encode_suback({
+              message_id: sub_id,
+              return_codes: [SuccessQoS2],
+            }),
+          ),
+        ),
+      )
+      first.write(Bytes::from_array(inbound))
+      let mut id = 0
+      let mut saw_rec = false
+      for _ in 0..<2 {
+        match @mqtt.decode_packet(read_packet(first, 4096)) {
+          Ok(PubrecPacket(p)) => {
+            assert_eq(p.message_id, 77)
+            saw_rec = true
+          }
+          Ok(PublishPacket(p)) => {
+            assert_eq(p.qos, @mqtt.QoS1)
+            id = p.message_id.unwrap()
+          }
+          _ => abort("expected PUBREC or QoS 1 PUBLISH")
+        }
+      }
+      assert_true(saw_rec && id != 0)
+      ready.put(id)
+      let closed = try {
+        let _ = read_packet(first, 4096)
+        false
+      } catch {
+        _ => true
+      }
+      assert_true(closed)
+      first.close()
+      let (second, _) = server.accept()
+      defer second.close()
+      let _ = read_packet(second, 4096)
+      second.write(b"\x20\x02\x01\x00")
+      match @mqtt.decode_packet(read_packet(second, 4096)) {
+        Ok(PublishPacket(p)) => {
+          assert_eq(p.message_id.unwrap(), id)
+          assert_true(p.dup)
+        }
+        _ => abort("expected replayed QoS 1 PUBLISH")
+      }
+      second.write(Bytes::from_array(encoded(@mqtt.encode_puback(id))))
+      let duplicate = encoded(
+        @mqtt.encode_publish({
+          topic: "test/in",
+          payload: b"once",
+          qos: @mqtt.QoS2,
+          message_id: Some(77),
+          retain: false,
+          dup: true,
+        }),
+      )
+      second.write(Bytes::from_array(duplicate))
+      assert_true(
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(PubrecPacket(_)),
+      )
+      second.write(Bytes::from_array(encoded(@mqtt.encode_pubrel(77))))
+      assert_true(
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(PubcompPacket(_)),
+      )
+      assert_true(
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(DisconnectPacket),
+      )
+    }
+    let config = Config::new("127.0.0.1", "old-close", port=server.addr.port())
+    config.clean_session = false
+    config.session_store = Some(store)
+    config.keep_alive_seconds = 0
+    let first = Client::connect(config, group)
+    assert_eq(first.subscribe("test/#", @mqtt.QoS2), @mqtt.QoS2)
+    let job = group.spawn(no_wait=true, allow_failure=true) <| () => {
+      first.publish("test/out", b"pending", qos=@mqtt.QoS1) catch {
+        _ => ()
+      }
+    }
+    let id = ready.get()
+    first.close()
+    job.wait()
+    let disk = decode_session(state.data.unwrap(), "old-close", store)
+    assert_true(disk.outgoing.contains(id))
+    assert_true(disk.incoming_qos2.get(77) is Some(false))
+    assert_true(disk.subscriptions.contains("test/#"))
+    assert_eq(disk.backlog.length(), 1)
+    assert_true(first.session.outgoing.contains(id))
+    assert_true(first.session.incoming_qos2.get(77) is Some(false))
+    assert_true(first.session.subscriptions.contains("test/#"))
+    assert_eq(first.session.backlog.length(), 1)
+    let second = first.reconnect(group)
+    assert_true(second.session_present())
+    assert_eq(second.receive().payload, b"once")
+    @async.with_timeout(1000, () => {
+      while !second.session.outgoing.is_empty() {
+        @async.sleep(5)
+      }
+    })
+    assert_true(second.session.backlog.is_empty())
+    assert_true(second.session.subscriptions.contains("test/#"))
+    second.disconnect()
+  }
+}
+
+///|
+async test "old stored client reconnects after drop in QoS 2 PUBREL stage" {
+  @async.with_task_group() <| group => {
+    let (store, state) = fault_store()
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    let sent : @async.Queue[Int32] = @async.Queue::Queue(kind=Blocking(1))
+    group.spawn_bg() <| () => {
+      let (first, _) = server.accept()
+      let _ = read_packet(first, 4096)
+      first.write(b"\x20\x02\x00\x00")
+      let sub_id = match @mqtt.decode_packet(read_packet(first, 4096)) {
+        Ok(SubscribePacket(p)) => p.message_id
+        _ => abort("expected SUBSCRIBE")
+      }
+      first.write(
+        Bytes::from_array(
+          encoded(
+            @mqtt.encode_suback({
+              message_id: sub_id,
+              return_codes: [SuccessQoS2],
+            }),
+          ),
+        ),
+      )
+      first.write(
+        Bytes::from_array(
+          encoded(
+            @mqtt.encode_publish({
+              topic: "test/in",
+              payload: b"once",
+              qos: @mqtt.QoS2,
+              message_id: Some(88),
+              retain: false,
+              dup: false,
+            }),
+          ),
+        ),
+      )
+      let mut id = 0
+      let mut saw_rec = false
+      for _ in 0..<2 {
+        match @mqtt.decode_packet(read_packet(first, 4096)) {
+          Ok(PubrecPacket(p)) => {
+            assert_eq(p.message_id, 88)
+            saw_rec = true
+          }
+          Ok(PublishPacket(p)) => {
+            assert_eq(p.qos, @mqtt.QoS2)
+            id = p.message_id.unwrap()
+          }
+          _ => abort("expected PUBREC or QoS 2 PUBLISH")
+        }
+      }
+      assert_true(saw_rec && id != 0)
+      first.write(Bytes::from_array(encoded(@mqtt.encode_pubrec(id))))
+      match @mqtt.decode_packet(read_packet(first, 4096)) {
+        Ok(PubrelPacket(p)) => assert_eq(p.message_id, id)
+        _ => abort("expected PUBREL")
+      }
+      sent.put(id)
+      first.close()
+      let (second, _) = server.accept()
+      defer second.close()
+      let _ = read_packet(second, 4096)
+      second.write(b"\x20\x02\x01\x00")
+      match @mqtt.decode_packet(read_packet(second, 4096)) {
+        Ok(PubrelPacket(p)) => assert_eq(p.message_id, id)
+        _ => abort("expected replayed PUBREL")
+      }
+      second.write(Bytes::from_array(encoded(@mqtt.encode_pubcomp(id))))
+      second.write(
+        Bytes::from_array(
+          encoded(
+            @mqtt.encode_publish({
+              topic: "test/in",
+              payload: b"once",
+              qos: @mqtt.QoS2,
+              message_id: Some(88),
+              retain: false,
+              dup: true,
+            }),
+          ),
+        ),
+      )
+      assert_true(
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(PubrecPacket(_)),
+      )
+      second.write(Bytes::from_array(encoded(@mqtt.encode_pubrel(88))))
+      assert_true(
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(PubcompPacket(_)),
+      )
+      assert_true(
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(DisconnectPacket),
+      )
+    }
+    let config = Config::new("127.0.0.1", "old-drop", port=server.addr.port())
+    config.clean_session = false
+    config.session_store = Some(store)
+    config.keep_alive_seconds = 0
+    let first = Client::connect(config, group)
+    assert_eq(first.subscribe("test/#", @mqtt.QoS2), @mqtt.QoS2)
+    let job = group.spawn(no_wait=true, allow_failure=true) <| () => {
+      first.publish("test/out", b"pending", qos=@mqtt.QoS2) catch {
+        _ => ()
+      }
+    }
+    let id = @async.with_timeout(2000, () => sent.get())
+    @async.with_timeout(1000, () => {
+      while !first.closed {
+        @async.sleep(5)
+      }
+    })
+    job.wait()
+    let disk = decode_session(state.data.unwrap(), "old-drop", store)
+    assert_true(disk.outgoing.get(id).unwrap().stage is WaitPubcomp)
+    assert_true(disk.incoming_qos2.get(88) is Some(false))
+    assert_true(disk.subscriptions.contains("test/#"))
+    assert_eq(disk.backlog.length(), 1)
+    assert_true(first.session.outgoing.contains(id))
+    assert_true(first.session.outgoing.get(id).unwrap().stage is WaitPubcomp)
+    assert_true(first.session.incoming_qos2.get(88) is Some(false))
+    assert_true(first.session.subscriptions.contains("test/#"))
+    assert_eq(first.session.backlog.length(), 1)
+    let second = first.reconnect(group)
+    assert_true(second.session_present())
+    assert_eq(second.receive().payload, b"once")
+    @async.with_timeout(1000, () => {
+      while !second.session.outgoing.is_empty() {
+        @async.sleep(5)
+      }
+    })
+    assert_true(second.session.subscriptions.contains("test/#"))
+    second.disconnect()
+  }
+}
+
+///|
+async test "closing during durable publish save keeps snapshot and old client aligned" {
+  @async.with_task_group() <| group => {
+    let mut snapshot : Bytes? = None
+    let mut writes = 0
+    let entered : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
+    let release : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
+    let store = SessionStore::new(() => snapshot, bytes => {
+      writes += 1
+      if writes == 3 {
+        entered.put(())
+        release.get()
+      }
+      snapshot = Some(bytes)
+    })
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    group.spawn_bg() <| () => {
+      let (first, _) = server.accept()
+      let _ = read_packet(first, 4096)
+      first.write(b"\x20\x02\x00\x00")
+      assert_true(
+        try {
+          let _ = read_packet(first, 4096)
+          false
+        } catch {
+          _ => true
+        },
+      )
+      first.close()
+      let (second, _) = server.accept()
+      defer second.close()
+      let _ = read_packet(second, 4096)
+      second.write(b"\x20\x02\x01\x00")
+      let id = match @mqtt.decode_packet(read_packet(second, 4096)) {
+        Ok(PublishPacket(p)) => {
+          assert_true(p.dup)
+          assert_eq(p.payload, b"pending")
+          p.message_id.unwrap()
+        }
+        _ => abort("expected replayed PUBLISH after delayed save")
+      }
+      second.write(Bytes::from_array(encoded(@mqtt.encode_puback(id))))
+      assert_true(
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(DisconnectPacket),
+      )
+    }
+    let config = Config::new("127.0.0.1", "save-close", port=server.addr.port())
+    config.clean_session = false
+    config.session_store = Some(store)
+    config.keep_alive_seconds = 0
+    let first = Client::connect(config, group)
+    assert_eq(writes, 2)
+    let publish_job = group.spawn(no_wait=true, allow_failure=true) <| () => {
+      first.publish("test/out", b"pending", qos=@mqtt.QoS1) catch {
+        _ => ()
+      }
+    }
+    @async.with_timeout(1000, () => entered.get())
+    let close_job = group.spawn(no_wait=true, allow_failure=true) <| () => {
+      first.close()
+    }
+    @async.with_timeout(1000, () => {
+      while !first.closed {
+        @async.sleep(5)
+      }
+    })
+    release.put(())
+    publish_job.wait()
+    close_job.wait()
+    let disk = decode_session(snapshot.unwrap(), "save-close", store)
+    assert_eq(writes, 3)
+    assert_eq(disk.order.length(), 1)
+    let id = disk.order[0]
+    assert_true(disk.outgoing.get(id).unwrap().stage is WaitPuback)
+    assert_true(first.session.outgoing.contains(id))
+    assert_eq(first.session.order, disk.order)
+    let second = first.reconnect(group)
+    assert_true(second.session_present())
+    @async.with_timeout(1000, () => {
+      while !second.session.outgoing.is_empty() {
+        @async.sleep(5)
+      }
+    })
+    second.disconnect()
+  }
+}

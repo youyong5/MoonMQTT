@@ -240,7 +240,13 @@ fn Client::finish(self : Client, reason : Error) -> Unit {
       Some(task) => task.cancel()
       None => ()
     }
-    if !self.config.clean_session && self.session.store is None {
+    if self.config.clean_session {
+      self.session.outgoing.clear()
+      self.session.order = []
+      self.session.incoming_qos2.clear()
+      self.session.subscriptions.clear()
+      self.session.backlog = []
+    } else if self.session.store is None {
       while true {
         let next = self.messages.try_get() catch { _ => None }
         match next {
@@ -248,11 +254,6 @@ fn Client::finish(self : Client, reason : Error) -> Unit {
           None => break
         }
       }
-    } else {
-      self.session.outgoing.clear()
-      self.session.order = []
-      self.session.incoming_qos2.clear()
-      self.session.subscriptions.clear()
     }
     self.messages.close(error=reason, clear=true)
     self.ping_reply.close(error=reason, clear=true)

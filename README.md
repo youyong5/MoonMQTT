@@ -22,6 +22,8 @@
 
 持久化是**可选**的；未配置 `session_store` 时仍仅支持同进程恢复。旧 `publish` 在断线或取消时仍会报错，即使后续连接自动完成协议重发；调用方不能将该错误直接判作 broker 未收到消息，也没有跨连接的逐条完成回调。待确认的订阅/取消订阅不会自动重试，调用方应自行重试。超时会终止当前连接，旧 TCP 连接的响应不会进入新连接的待处理表。
 
+关闭或异常断线后，clean session 清理本地会话；无存储的持久会话将未消费的接收队列收拢到内存会话；配置 `SessionStore` 的持久会话保留与最近一次成功快照一致的内存状态。后一种情况下，**旧 `Client`** 可直接调用 `reconnect(group)` 恢复同进程会话，包括原 ID、QoS 2 阶段、入站去重及订阅。若发生存储失败，旧会话会被标记为不可直接复用，须先修复存储并用 `Client::connect()` 从最后完整快照重建。
+
 使用持久存储时，库会先保存未消费消息和入站 QoS 2 去重记录，再发送 PUBREC；先保存 QoS 2 的 PUBREL 阶段，再发送 PUBREL。`receive()` 会先从快照删除消息，再返回给调用方。因此**返回后应用尚未完成处理就崩溃时，库不能保证应用层恰好一次**；即使崩溃发生在保存删除记录与函数返回之间，应用也可能拿不到消息。需要应用处理确认或事务一致性时，须在应用层另行设计。QoS 1 允许重投递。
 
 ## 最小示例
@@ -115,4 +117,4 @@ powershell -ExecutionPolicy Bypass -File tests\interop.ps1
 powershell -ExecutionPolicy Bypass -File tests\interop.ps1 -MosquittoDirectory 'D:\path\to\mosquitto\bin'
 ```
 
-本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出、QoS 2 连续重复 PUBREC、跨进程 QoS 1/2 重发、损坏快照、存储故障前不发送确认、以及持久会话两种 `Session Present` 结果。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。
+本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出、QoS 2 连续重复 PUBREC、旧 `Client` 在主动关闭和异常断线后的同进程恢复、关闭与异步保存交错、跨进程 QoS 1/2 重发、损坏快照、存储故障前不发送确认、以及持久会话两种 `Session Present` 结果。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。

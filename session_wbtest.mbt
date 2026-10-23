@@ -583,3 +583,77 @@ async test "concurrent persistent publications replay in original order" {
     second.disconnect()
   }
 }
+
+///|
+async test "finish drains unread in memory session and clears clean session" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    group.spawn_bg() <| () => {
+      for _ in 0..<2 {
+        let (conn, _) = server.accept()
+        let _ = read_packet(conn, 4096)
+        conn.write(b"\x20\x02\x00\x00")
+        assert_true(
+          try {
+            let _ = read_packet(conn, 4096)
+            false
+          } catch {
+            _ => true
+          },
+        )
+        conn.close()
+      }
+    }
+    let config = Config::new(
+      "127.0.0.1",
+      "finish-memory",
+      port=server.addr.port(),
+    )
+    config.clean_session = false
+    config.keep_alive_seconds = 0
+    let persistent = Client::connect(config, group)
+    let message : Message = {
+      topic: "test/in",
+      payload: b"queued",
+      qos: @mqtt.QoS2,
+      retain: false,
+      dup: false,
+    }
+    assert_true(persistent.messages.try_put(message))
+    persistent.session.incoming_qos2[77] = false
+    persistent.session.subscriptions["test/#"] = @mqtt.QoS1
+    persistent.close()
+    assert_eq(persistent.session.backlog.length(), 1)
+    assert_eq(persistent.session.backlog[0].payload, b"queued")
+    assert_true(persistent.session.incoming_qos2.get(77) is Some(false))
+    assert_true(persistent.session.subscriptions.contains("test/#"))
+
+    let clean_config = Config::new(
+      "127.0.0.1",
+      "finish-clean",
+      port=server.addr.port(),
+    )
+    clean_config.keep_alive_seconds = 0
+    let clean = Client::connect(clean_config, group)
+    assert_true(clean.messages.try_put(message))
+    clean.session.backlog.push(message)
+    clean.session.incoming_qos2[77] = false
+    clean.session.subscriptions["test/#"] = @mqtt.QoS1
+    clean.session.outgoing[12] = {
+      topic: "test/out",
+      payload: b"pending",
+      qos: @mqtt.QoS1,
+      retain: false,
+      stage: WaitPuback,
+      pubrel_sent: false,
+    }
+    clean.session.order.push(12)
+    clean.close()
+    assert_true(clean.session.backlog.is_empty())
+    assert_true(clean.session.incoming_qos2.is_empty())
+    assert_true(clean.session.subscriptions.is_empty())
+    assert_true(clean.session.outgoing.is_empty())
+    assert_true(clean.session.order.is_empty())
+  }
+}
