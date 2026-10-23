@@ -66,6 +66,7 @@ enum PendingKind {
 ///|
 struct Pending {
   mut kind : PendingKind
+  mut ack_queued : Bool
   reply : @async.Queue[@mqtt.Packet]
 }
 
@@ -260,7 +261,11 @@ fn Client::allocate_id(self : Client) -> Int32 raise MqttError {
 fn Client::reserve(self : Client, kind : PendingKind) -> Int32 raise {
   self.ensure_open()
   let id = self.allocate_id()
-  self.pending[id] = { kind, reply: @async.Queue::Queue(kind=Blocking(1)), }
+  self.pending[id] = {
+    kind,
+    ack_queued: false,
+    reply: @async.Queue::Queue(kind=Blocking(1)),
+  }
   id
 }
 
@@ -278,7 +283,12 @@ fn Client::resolve(self : Client, id : Int32, packet : @mqtt.Packet) -> Unit {
       }
       if !valid {
         self.finish(Protocol("acknowledgement type does not match packet ID"))
+      } else if pending.kind is Pubrec && pending.ack_queued {
+        // The first PUBREC may already be delivered to a waiting task even
+        // though that task has not advanced its state yet.
+        ()
       } else {
+        pending.ack_queued = true
         let queued = pending.reply.try_put(packet) catch { _ => false }
         if !queued && !(pending.kind is Pubrec) {
           self.finish(

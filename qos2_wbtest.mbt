@@ -1,4 +1,51 @@
 ///|
+async test "two PUBREC dispatched before publisher resumes keep one pending confirmation" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    let sent : @async.Queue[Int32] = @async.Queue::Queue(kind=Blocking(1))
+    group.spawn_bg() <| () => {
+      let (conn, _) = server.accept()
+      defer conn.close()
+      let _ = read_packet(conn, 4096)
+      conn.write(b"\x20\x02\x00\x00")
+      let first = read_packet(conn, 4096)
+      let id = match @mqtt.decode_packet(first) {
+        Ok(PublishPacket(p)) => p.message_id.unwrap()
+        _ => abort("expected PUBLISH")
+      }
+      sent.put(id)
+      assert_true(
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(PubrelPacket(_)),
+      )
+      conn.write(Bytes::from_array(encoded(@mqtt.encode_pubrec(id))))
+      assert_true(
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(PubrelPacket(_)),
+      )
+      conn.write(Bytes::from_array(encoded(@mqtt.encode_pubcomp(id))))
+      assert_true(
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(DisconnectPacket),
+      )
+    }
+    let config = Config::new("127.0.0.1", "double-rec", port=server.addr.port())
+    config.keep_alive_seconds = 0
+    let client = Client::connect(config, group)
+    let publishing = group.spawn(no_wait=true, allow_failure=true) <| () => {
+      client.publish("test/double", b"payload", qos=@mqtt.QoS2)
+    }
+    let id = sent.get()
+    let packet : @mqtt.Packet = PubrecPacket({ message_id: id, })
+    // No await between dispatches: the publisher cannot consume the first yet.
+    client.resolve(id, packet)
+    client.resolve(id, packet)
+    assert_true(!client.closed)
+    assert_true(client.pending.get(id).unwrap().kind is Pubrec)
+    publishing.wait()
+    client.disconnect()
+  }
+}
+
+///|
 async test "outgoing QoS 2 keeps ID until PUBCOMP and repeats PUBREL only" {
   @async.with_task_group() <| group => {
     let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
