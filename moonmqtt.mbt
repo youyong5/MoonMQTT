@@ -12,6 +12,26 @@ pub(all) struct Config {
   mut inbox_capacity : Int32
   mut clean_session : Bool
   mut session_store : SessionStore?
+  mut will : Will?
+}
+
+///|
+/// Last Will associated with each accepted MQTT network connection.
+pub(all) struct Will {
+  topic : String
+  payload : Bytes
+  qos : @mqtt.QoS
+  retain : Bool
+}
+
+///|
+pub fn Will::new(
+  topic : String,
+  payload : Bytes,
+  qos~ : @mqtt.QoS = @mqtt.QoS0,
+  retain~ : Bool = false,
+) -> Will {
+  { topic, payload, qos, retain, }
 }
 
 ///|
@@ -32,6 +52,7 @@ pub fn Config::new(
     inbox_capacity: 256,
     clean_session: true,
     session_store: None,
+    will: None,
   }
 }
 
@@ -58,6 +79,7 @@ pub suberror MqttError {
   IncompatibleSessionVersion(Int32)
   SessionClientIdMismatch(String)
   RecoveryUncertain
+  DisconnectUncertain
 } derive(Debug)
 
 ///|
@@ -195,6 +217,20 @@ fn validate(config : Config) -> Unit raise MqttError {
   }
   if config.clean_session && config.session_store is Some(_) {
     raise InvalidConfig("session store requires clean_session=false")
+  }
+  match config.will {
+    Some(will) => {
+      if will.topic == "" ||
+        will.topic.contains("#") ||
+        will.topic.contains("+") ||
+        @mqtt.encode_string(will.topic) is Err(_) {
+        raise InvalidConfig("will topic must be a valid MQTT topic name")
+      }
+      if will.payload.length() > 65535 {
+        raise InvalidConfig("will payload exceeds 65535 bytes")
+      }
+    }
+    None => ()
   }
 }
 
@@ -757,20 +793,24 @@ async fn[X] connect_with_session(
     session.connecting = true
     client.save_session()
   }
+  let (will_retain, will_qos, will_topic, will_message) = match config.will {
+    Some(will) => (will.retain, will.qos, Some(will.topic), Some(will.payload))
+    None => (false, @mqtt.QoS0, None, None)
+  }
   let flags = @mqtt.ConnectFlags::{
     username: config.username is Some(_),
     password: config.password is Some(_),
-    will_retain: false,
-    will_qos: @mqtt.QoS0,
-    will_flag: false,
+    will_retain,
+    will_qos,
+    will_flag: config.will is Some(_),
     clean_session: config.clean_session,
   }
   let packet = @mqtt.Connect::{
     client_id: config.client_id,
     username: config.username,
     password: config.password,
-    will_topic: None,
-    will_message: None,
+    will_topic,
+    will_message,
     keep_alive: config.keep_alive_seconds,
     flags,
   }

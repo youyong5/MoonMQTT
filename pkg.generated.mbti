@@ -26,6 +26,7 @@ pub suberror MqttError {
   IncompatibleSessionVersion(Int)
   SessionClientIdMismatch(String)
   RecoveryUncertain
+  DisconnectUncertain
 } derive(@debug.Debug)
 pub fn MqttError::to_repr(Self) -> @debug.Repr
 
@@ -98,6 +99,7 @@ pub(all) struct Config {
   mut inbox_capacity : Int
   mut clean_session : Bool
   mut session_store : SessionStore?
+  mut will : Will?
 }
 pub fn Config::new(String, String, port? : Int) -> Self
 
@@ -125,6 +127,14 @@ pub struct SessionStore {
 }
 pub fn SessionStore::file(String) -> Self
 pub fn SessionStore::new(async () -> Bytes?, async (Bytes) -> Unit) -> Self
+
+pub(all) struct Will {
+  topic : String
+  payload : Bytes
+  qos : @moonbit-mqtt.QoS
+  retain : Bool
+}
+pub fn Will::new(String, Bytes, qos? : @moonbit-mqtt.QoS, retain? : Bool) -> Self
 
 // Type aliases
 

@@ -53,6 +53,7 @@ fn retryable(error : Error) -> Bool {
     | CorruptSession(_)
     | IncompatibleSessionVersion(_)
     | SessionClientIdMismatch(_)
+    | DisconnectUncertain
     | RecoveryUncertain => false
     _ => true
   }
@@ -156,8 +157,6 @@ async fn[X] AutoClient::run(
           @async.sleep(10)
         }
         if self.stopped {
-          client.close()
-          self.current = None
           return
         }
         let error = match client.last_error {
@@ -169,6 +168,9 @@ async fn[X] AutoClient::run(
         error
       }
       Err(e) => e
+    }
+    if self.stopped {
+      return
     }
     self.last_error = Some(reason)
     if self.session.storage_failed || !retryable(reason) {
@@ -281,24 +283,57 @@ pub async fn AutoClient::unsubscribe(
 }
 
 ///|
-/// Stop retries, interrupt the current connection and wait for the supervisor.
+/// Stop retries, send DISCONNECT if the current connection is live, then close.
+/// DisconnectUncertain means cleanup succeeded but the broker may publish a Will.
 pub async fn AutoClient::stop(self : AutoClient) -> Unit {
+  self.stop_with_disconnect(client => client.disconnect())
+}
+
+///|
+async fn AutoClient::stop_with_disconnect(
+  self : AutoClient,
+  send_disconnect : async (Client) -> Unit,
+) -> Unit {
   if !self.stopped {
     self.stopped = true
     self.status = Stopped
-    match self.current {
-      Some(client) => client.close()
-      None => ()
-    }
-    match self.task {
-      Some(task) => {
-        task.cancel()
-        task.wait() catch {
-          _ => ()
+    @async.protect_from_cancel(() => {
+      let mut uncertain = false
+      match self.current {
+        Some(client) => {
+          if client.closed {
+            uncertain = true
+          } else {
+            let sent : Result[Unit?, Error] = Ok(
+              @async.with_timeout_opt(self.config.timeout_ms, () => {
+                send_disconnect(client)
+              }),
+            ) catch {
+              e => Err(e)
+            }
+            if sent is Err(_) || sent is Ok(None) {
+              uncertain = true
+            }
+          }
+          client.close() catch {
+            _ => uncertain = true
+          }
         }
+        None => ()
       }
-      None => ()
-    }
-    self.current = None
+      match self.task {
+        Some(task) => {
+          task.cancel()
+          task.wait() catch {
+            _ => ()
+          }
+        }
+        None => ()
+      }
+      self.current = None
+      if uncertain {
+        raise DisconnectUncertain
+      }
+    })
   }
 }

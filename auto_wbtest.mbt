@@ -23,12 +23,7 @@ async test "automatic reconnect caps backoff and recovers after three failures" 
         @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(PublishPacket(_)),
       )
       assert_true(
-        try {
-          let _ = read_packet(conn, 4096)
-          false
-        } catch {
-          _ => true
-        },
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(DisconnectPacket),
       )
     }
     let config = Config::new(
@@ -84,12 +79,7 @@ async test "automatic mode retries TCP connect failure until listener appears" {
       let _ = read_packet(conn, 4096)
       conn.write(b"\x20\x02\x00\x00")
       assert_true(
-        try {
-          let _ = read_packet(conn, 4096)
-          false
-        } catch {
-          _ => true
-        },
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(DisconnectPacket),
       )
     }
     @async.with_timeout(2000, () => auto.wait_connected())
@@ -250,12 +240,7 @@ async test "automatic SP1 resumes QoS 1 PUBLISH and QoS 2 PUBREL without reissui
         @mqtt.decode_packet(read_packet(second, 4096)) is Ok(PublishPacket(_)),
       )
       assert_true(
-        try {
-          let _ = read_packet(second, 4096)
-          false
-        } catch {
-          _ => true
-        },
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(DisconnectPacket),
       )
     }
     let config = Config::new("127.0.0.1", "auto-sp1", port=server.addr.port())
@@ -356,12 +341,7 @@ async test "automatic SP0 rebuilds subscriptions before becoming connected" {
         ),
       )
       assert_true(
-        try {
-          let _ = read_packet(second, 4096)
-          false
-        } catch {
-          _ => true
-        },
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(DisconnectPacket),
       )
     }
     let config = Config::new("127.0.0.1", "auto-sp0", port=server.addr.port())
@@ -490,12 +470,7 @@ async test "heartbeat timeout enters automatic retry and reconnects" {
       second.write(b"\x20\x02\x01\x00")
       retried.put(())
       assert_true(
-        try {
-          let _ = read_packet(second, 4096)
-          false
-        } catch {
-          _ => true
-        },
+        @mqtt.decode_packet(read_packet(second, 4096)) is Ok(DisconnectPacket),
       )
     }
     let config = Config::new("127.0.0.1", "auto-ping", port=server.addr.port())
