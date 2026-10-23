@@ -123,7 +123,15 @@ async test "automatic reconnect repeats Will in each CONNECT and stop sends DISC
         @async.sleep(5)
       }
     })
-    auto.stop()
+    assert_true(
+      try {
+        auto.stop()
+        false
+      } catch {
+        DisconnectUncertain => true
+        _ => false
+      },
+    )
     assert_true(auto.status() is Stopped)
   }
 }
@@ -166,5 +174,91 @@ async test "failed automatic DISCONNECT still cleans up and reports uncertainty"
     assert_true(uncertain)
     assert_true(auto.status() is Stopped)
     assert_true(auto.current is None)
+  }
+}
+
+///|
+async test "stop during CONNACK wait reports possible Will publication" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    let connected : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
+    group.spawn_bg() <| () => {
+      let (conn, _) = server.accept()
+      assert_true(
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(ConnectPacket(_)),
+      )
+      connected.put(())
+      assert_true(
+        try {
+          let _ = read_packet(conn, 4096)
+          false
+        } catch {
+          _ => true
+        },
+      )
+      conn.close()
+    }
+    let config = Config::new(
+      "127.0.0.1",
+      "will-stop-handshake",
+      port=server.addr.port(),
+    )
+    config.keep_alive_seconds = 0
+    config.will = Some(Will::new("test/handshake", b"offline"))
+    let auto = AutoClient::start(config, group)
+    @async.with_timeout(2000, () => connected.get())
+    assert_true(auto.status() is Connecting)
+    let uncertain = try {
+      auto.stop()
+      false
+    } catch {
+      DisconnectUncertain => true
+      _ => false
+    }
+    assert_true(uncertain)
+    assert_true(auto.status() is Stopped)
+  }
+}
+
+///|
+async test "stop in retry after accepted Will reports uncertainty" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    group.spawn_bg() <| () => {
+      let (conn, _) = server.accept()
+      assert_true(
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(ConnectPacket(_)),
+      )
+      conn.write(b"\x20\x02\x00\x00")
+      conn.close()
+    }
+    let config = Config::new(
+      "127.0.0.1",
+      "will-stop-retry",
+      port=server.addr.port(),
+    )
+    config.keep_alive_seconds = 0
+    config.will = Some(Will::new("test/retry", b"offline"))
+    let auto = AutoClient::start(
+      config,
+      group,
+      policy=ReconnectPolicy::new(initial_delay_ms=500, max_delay_ms=500),
+    )
+    @async.with_timeout(2000, () => {
+      while !(auto.status() is Retrying(_, _)) {
+        @async.sleep(5)
+      }
+    })
+    let uncertain = try {
+      auto.stop()
+      false
+    } catch {
+      DisconnectUncertain => true
+      _ => false
+    }
+    assert_true(uncertain)
+    assert_true(auto.status() is Stopped)
   }
 }

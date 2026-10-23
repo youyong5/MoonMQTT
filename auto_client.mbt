@@ -37,6 +37,8 @@ pub struct AutoClient {
   mut status : AutoStatus
   mut last_error : Error?
   mut stopped : Bool
+  mut will_connect_attempted : Bool
+  mut earlier_will_uncertain : Bool
   mut task : @async.Task[Unit]?
   receive_lock : @async.Mutex
 }
@@ -54,6 +56,7 @@ fn retryable(error : Error) -> Bool {
     | IncompatibleSessionVersion(_)
     | SessionClientIdMismatch(_)
     | DisconnectUncertain
+    | TlsValidation(_)
     | RecoveryUncertain => false
     _ => true
   }
@@ -97,6 +100,8 @@ pub async fn[X] AutoClient::start(
     status: Connecting,
     last_error: None,
     stopped: false,
+    will_connect_attempted: false,
+    earlier_will_uncertain: false,
     task: None,
     receive_lock: @async.Mutex::Mutex(),
   }
@@ -142,7 +147,12 @@ async fn[X] AutoClient::run(
   let mut delay = self.policy.initial_delay_ms
   while !self.stopped {
     let connected : Result[Client, Error] = Ok(
-      connect_with_session(self.config, self.session, group),
+      connect_with_session(
+        self.config,
+        self.session,
+        group,
+        on_mqtt_connect=Some(() => self.will_connect_attempted = true),
+      ),
     ) catch {
       e => Err(e)
     }
@@ -159,6 +169,10 @@ async fn[X] AutoClient::run(
         if self.stopped {
           return
         }
+        if self.will_connect_attempted && self.config.will is Some(_) {
+          self.earlier_will_uncertain = true
+        }
+        self.will_connect_attempted = false
         let error = match client.last_error {
           Some(e) => e
           None => Closed
@@ -167,7 +181,13 @@ async fn[X] AutoClient::run(
         self.current = None
         error
       }
-      Err(e) => e
+      Err(e) => {
+        if self.will_connect_attempted && self.config.will is Some(_) {
+          self.earlier_will_uncertain = true
+        }
+        self.will_connect_attempted = false
+        e
+      }
     }
     if self.stopped {
       return
@@ -298,7 +318,7 @@ async fn AutoClient::stop_with_disconnect(
     self.stopped = true
     self.status = Stopped
     @async.protect_from_cancel(() => {
-      let mut uncertain = false
+      let mut uncertain = self.earlier_will_uncertain
       match self.current {
         Some(client) => {
           if client.closed {
@@ -313,6 +333,8 @@ async fn AutoClient::stop_with_disconnect(
             }
             if sent is Err(_) || sent is Ok(None) {
               uncertain = true
+            } else {
+              self.will_connect_attempted = false
             }
           }
           client.close() catch {
@@ -329,6 +351,9 @@ async fn AutoClient::stop_with_disconnect(
           }
         }
         None => ()
+      }
+      if self.will_connect_attempted && self.config.will is Some(_) {
+        uncertain = true
       }
       self.current = None
       if uncertain {

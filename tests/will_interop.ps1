@@ -98,7 +98,8 @@ try {
   if (-not $auto.WaitForExit(15000)) { throw 'Automatic client did not reconnect' }
   $autoResult = Get-Content -Raw $autoOutput
   $autoErrorText = Get-Content -Raw $autoError
-  if ($autoResult -notmatch 'AUTO_RECONNECTED' -or $autoErrorText) {
+  if ($autoResult -notmatch 'AUTO_RECONNECTED' -or
+      $autoResult -notmatch 'WILL_UNCERTAIN' -or $autoErrorText) {
     throw "Automatic Will reconnect failed: $autoResult $autoErrorText"
   }
   Wait-Text $brokerError 'Received DISCONNECT from moonmqtt-will-auto' 'clean automatic stop'

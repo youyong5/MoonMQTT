@@ -5,6 +5,7 @@ import {
   "moonbitlang/async",
   "moonbitlang/async/aqueue",
   "moonbitlang/async/socket",
+  "moonbitlang/async/tls",
   "moonbitlang/core/debug",
   "zbhzs1/moonbit-mqtt",
 }
@@ -27,6 +28,7 @@ pub suberror MqttError {
   SessionClientIdMismatch(String)
   RecoveryUncertain
   DisconnectUncertain
+  TlsValidation(String)
 } derive(@debug.Debug)
 pub fn MqttError::to_repr(Self) -> @debug.Repr
 
@@ -39,6 +41,8 @@ pub struct AutoClient {
   mut status : AutoStatus
   mut last_error : Error?
   mut stopped : Bool
+  mut will_connect_attempted : Bool
+  mut earlier_will_uncertain : Bool
   mut task : @async.Task[Unit]?
   receive_lock : @async.Mutex
 }
@@ -65,6 +69,7 @@ pub struct Client {
   config : Config
   session : Session
   tcp : @socket.Tcp
+  tls : @tls.Tls?
   write_lock : @async.Mutex
   receive_lock : @async.Mutex
   messages : @aqueue.Queue[Message]
@@ -100,6 +105,7 @@ pub(all) struct Config {
   mut clean_session : Bool
   mut session_store : SessionStore?
   mut will : Will?
+  mut tls : TlsConfig?
 }
 pub fn Config::new(String, String, port? : Int) -> Self
 
@@ -127,6 +133,11 @@ pub struct SessionStore {
 }
 pub fn SessionStore::file(String) -> Self
 pub fn SessionStore::new(async () -> Bytes?, async (Bytes) -> Unit) -> Self
+
+pub(all) struct TlsConfig {
+  ca_file : String?
+}
+pub fn TlsConfig::new(ca_file? : String) -> Self
 
 pub(all) struct Will {
   topic : String

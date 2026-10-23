@@ -13,6 +13,19 @@ pub(all) struct Config {
   mut clean_session : Bool
   mut session_store : SessionStore?
   mut will : Will?
+  mut tls : TlsConfig?
+}
+
+///|
+/// TLS verifies the broker certificate and config.host by default.
+/// A custom PEM CA replaces the system root set.
+pub(all) struct TlsConfig {
+  ca_file : String?
+}
+
+///|
+pub fn TlsConfig::new(ca_file? : String) -> TlsConfig {
+  { ca_file, }
 }
 
 ///|
@@ -53,6 +66,7 @@ pub fn Config::new(
     clean_session: true,
     session_store: None,
     will: None,
+    tls: None,
   }
 }
 
@@ -80,6 +94,7 @@ pub suberror MqttError {
   SessionClientIdMismatch(String)
   RecoveryUncertain
   DisconnectUncertain
+  TlsValidation(String)
 } derive(Debug)
 
 ///|
@@ -175,6 +190,7 @@ pub struct Client {
   config : Config
   session : Session
   tcp : @socket.Tcp
+  tls : @tls.Tls?
   write_lock : @async.Mutex
   receive_lock : @async.Mutex
   messages : @async.Queue[Message]
@@ -217,6 +233,9 @@ fn validate(config : Config) -> Unit raise MqttError {
   }
   if config.clean_session && config.session_store is Some(_) {
     raise InvalidConfig("session store requires clean_session=false")
+  }
+  if config.tls is Some({ ca_file: Some(""), }) {
+    raise InvalidConfig("TLS CA file path is empty")
   }
   match config.will {
     Some(will) => {
@@ -314,6 +333,10 @@ pub async fn Client::close(self : Client) -> Unit {
         Some(task) => task.wait() catch { _ => () }
         None => ()
       }
+      match self.tls {
+        Some(tls) => tls.close()
+        None => ()
+      }
       self.tcp.close()
     })
   }
@@ -321,34 +344,34 @@ pub async fn Client::close(self : Client) -> Unit {
 
 ///|
 /// Read exactly one frame, including a variable length header and fragmented body.
-async fn read_rest(
-  tcp : @socket.Tcp,
+async fn[R : @io.Reader] read_rest(
+  reader : R,
   length : Int32,
   timeout_ms : Int32,
 ) -> Bytes {
   if timeout_ms == 0 {
-    return tcp.read_exactly(length)
+    return reader.read_exactly(length)
   }
   @async.with_timeout(
     timeout_ms,
-    () => tcp.read_exactly(length),
+    () => reader.read_exactly(length),
     error=TimedOut,
   )
 }
 
 ///|
-async fn read_packet(
-  tcp : @socket.Tcp,
+async fn[R : @io.Reader] read_packet(
+  reader : R,
   max_size : Int32,
   timeout_ms~ : Int32 = 0,
 ) -> Array[Byte] {
-  let first = tcp.read_exactly(1)
+  let first = reader.read_exactly(1)
   let packet : Array[Byte] = [first[0]]
   let mut multiplier = 1
   let mut remaining = 0
   let mut finished = false
   for _ in 0..<4 {
-    let byte = read_rest(tcp, 1, timeout_ms)[0]
+    let byte = read_rest(reader, 1, timeout_ms)[0]
     packet.push(byte)
     remaining += (byte.to_int() & 127) * multiplier
     if (byte.to_int() & 128) == 0 {
@@ -363,10 +386,21 @@ async fn read_packet(
   if packet.length() + remaining > max_size {
     raise Protocol("packet exceeds configured limit")
   }
-  for byte in read_rest(tcp, remaining, timeout_ms) {
+  for byte in read_rest(reader, remaining, timeout_ms) {
     packet.push(byte)
   }
   packet
+}
+
+///|
+async fn Client::read_packet(
+  self : Client,
+  timeout_ms~ : Int32 = 0,
+) -> Array[Byte] {
+  match self.tls {
+    Some(tls) => read_packet(tls, self.config.max_packet_size, timeout_ms~)
+    None => read_packet(self.tcp, self.config.max_packet_size, timeout_ms~)
+  }
 }
 
 ///|
@@ -379,7 +413,10 @@ async fn Client::send(self : Client, bytes : Array[Byte]) -> Unit {
         self.write_lock.acquire()
         defer self.write_lock.release()
         self.ensure_open()
-        self.tcp.write(Bytes::from_array(bytes))
+        match self.tls {
+          Some(tls) => tls.write(Bytes::from_array(bytes))
+          None => self.tcp.write(Bytes::from_array(bytes))
+        }
       },
       error=TimedOut,
     )
@@ -455,11 +492,7 @@ fn Client::resolve(self : Client, id : Int32, packet : @mqtt.Packet) -> Unit {
 ///|
 async fn Client::reader(self : Client) -> Unit {
   while !self.closed {
-    let bytes = read_packet(
-      self.tcp,
-      self.config.max_packet_size,
-      timeout_ms=self.config.timeout_ms,
-    ) catch {
+    let bytes = self.read_packet(timeout_ms=self.config.timeout_ms) catch {
       e => {
         self.finish(e)
         return
@@ -752,6 +785,7 @@ async fn[X] connect_with_session(
   config : Config,
   session : Session,
   group : @async.TaskGroup[X],
+  on_mqtt_connect~ : (() -> Unit)? = None,
 ) -> Client {
   validate(config)
   if session.client_id != config.client_id {
@@ -759,6 +793,14 @@ async fn[X] connect_with_session(
   }
   if session.active {
     raise InvalidConfig("session is already connected or reconnecting")
+  }
+  match config.tls {
+    Some({ ca_file: Some(path), }) => {
+      let _ = @fs.read_file(path) catch {
+        _ => raise InvalidConfig("TLS CA file cannot be read")
+      }
+    }
+    _ => ()
   }
   session.active = true
   errdefer {
@@ -771,10 +813,29 @@ async fn[X] connect_with_session(
   )
   let mut tcp_owned_by_client = false
   errdefer (if !tcp_owned_by_client { tcp.close() })
+  let tls = match config.tls {
+    Some(options) => {
+      let trust = match options.ca_file {
+        Some(path) => @tls.CustomPemFile(path)
+        None => @tls.SystemRoot
+      }
+      let secured = @async.with_timeout(
+        config.timeout_ms,
+        () => @tls.Tls::client(tcp, host=config.host, trust~),
+        error=TimedOut,
+      ) catch {
+        @tls.TlsError(reason) => raise TlsValidation(reason)
+        e => raise e
+      }
+      Some(secured)
+    }
+    None => None
+  }
   let client = {
     config,
     session,
     tcp,
+    tls,
     write_lock: @async.Mutex::Mutex(),
     receive_lock: @async.Mutex::Mutex(),
     messages: @async.Queue::Queue(kind=Blocking(config.inbox_capacity)),
@@ -815,10 +876,14 @@ async fn[X] connect_with_session(
     flags,
   }
   let handshake : Result[Bool, Error] = try {
+    match on_mqtt_connect {
+      Some(callback) => callback()
+      None => ()
+    }
     client.send(encoded(@mqtt.encode_connect(packet)))
     let frame = @async.with_timeout(
       config.timeout_ms,
-      () => read_packet(tcp, config.max_packet_size),
+      () => client.read_packet(),
       error=TimedOut,
     )
     match @mqtt.decode_packet(frame) {

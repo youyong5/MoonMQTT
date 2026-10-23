@@ -51,7 +51,20 @@ async fn main {
         })
         println("AUTO_RECONNECTED")
       }
-      client.stop()
+      if mode == "auto" {
+        let uncertain = try {
+          client.stop()
+          false
+        } catch {
+          @client.DisconnectUncertain => true
+          _ => false
+        }
+        if uncertain {
+          println("WILL_UNCERTAIN")
+        }
+      } else {
+        client.stop()
+      }
     })
   } else {
     @async.with_task_group(group => {
