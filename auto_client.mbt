@@ -319,10 +319,13 @@ async fn AutoClient::stop_with_disconnect(
     self.status = Stopped
     @async.protect_from_cancel(() => {
       let mut uncertain = self.earlier_will_uncertain
+      let mut stop_error : Error? = None
       match self.current {
         Some(client) => {
           if client.closed {
-            uncertain = true
+            if self.config.will is Some(_) {
+              uncertain = true
+            }
           } else {
             let sent : Result[Unit?, Error] = Ok(
               @async.with_timeout_opt(self.config.timeout_ms, () => {
@@ -331,19 +334,36 @@ async fn AutoClient::stop_with_disconnect(
             ) catch {
               e => Err(e)
             }
-            if sent is Err(_) || sent is Ok(None) {
-              uncertain = true
-            } else {
-              // MQTT 3.1.1 has no DISCONNECT acknowledgement. A local write
-              // cannot prove the broker discarded this connection's Will.
-              if self.config.will is Some(_) {
-                uncertain = true
+            match sent {
+              Err(e) =>
+                if self.config.will is Some(_) {
+                  uncertain = true
+                } else {
+                  stop_error = Some(e)
+                }
+              Ok(None) =>
+                if self.config.will is Some(_) {
+                  uncertain = true
+                } else {
+                  stop_error = Some(TimedOut)
+                }
+              Ok(Some(_)) => {
+                // MQTT 3.1.1 has no DISCONNECT acknowledgement. A local
+                // write cannot prove the broker discarded this Will.
+                if self.config.will is Some(_) {
+                  uncertain = true
+                }
+                self.will_connect_attempted = false
               }
-              self.will_connect_attempted = false
             }
           }
           client.close() catch {
-            _ => uncertain = true
+            e =>
+              if self.config.will is Some(_) {
+                uncertain = true
+              } else if stop_error is None {
+                stop_error = Some(e)
+              }
           }
         }
         None => ()
@@ -363,6 +383,10 @@ async fn AutoClient::stop_with_disconnect(
       self.current = None
       if uncertain {
         raise DisconnectUncertain
+      }
+      match stop_error {
+        Some(e) => raise e
+        None => ()
       }
     })
   }

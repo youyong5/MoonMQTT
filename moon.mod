@@ -23,7 +23,7 @@ keywords = [ ]
 
 preferred_target = "native"
 
-description = "MQTT 3.1.1 TCP client library for MoonBit"
+description = "MQTT 3.1.1 client library for MoonBit with TCP and TLS transports"
 
 import {
   "moonbitlang/async@0.22.5",

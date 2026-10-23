@@ -321,6 +321,21 @@ fn Client::finish(self : Client, reason : Error) -> Unit {
 
 ///|
 pub async fn Client::close(self : Client) -> Unit {
+  self.close_with_tls_close(() => {
+    match self.tls {
+      Some(tls) => tls.close()
+      None => ()
+    }
+    Ok(())
+  })
+}
+
+///|
+/// Kept separate so a failing TLS close can be injected in a transport test.
+async fn Client::close_with_tls_close(
+  self : Client,
+  close_tls : () -> Result[Unit, Error],
+) -> Unit {
   self.finish(Closed)
   if !self.disposed {
     self.disposed = true
@@ -333,11 +348,12 @@ pub async fn Client::close(self : Client) -> Unit {
         Some(task) => task.wait() catch { _ => () }
         None => ()
       }
-      match self.tls {
-        Some(tls) => tls.close()
-        None => ()
-      }
+      let tls_result = close_tls()
       self.tcp.close()
+      match tls_result {
+        Err(e) => raise e
+        Ok(_) => ()
+      }
     })
   }
 }

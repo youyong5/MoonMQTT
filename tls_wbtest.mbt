@@ -49,6 +49,51 @@ async test "TLS handshake times out before MQTT CONNECT" {
 }
 
 ///|
+async test "TCP closes even when TLS close reports failure" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    let peer_closed : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
+    group.spawn_bg() <| () => {
+      let (conn, _) = server.accept()
+      defer conn.close()
+      let _ = read_packet(conn, 4096)
+      conn.write(b"\x20\x02\x00\x00")
+      assert_true(
+        try {
+          let _ = read_packet(conn, 4096)
+          false
+        } catch {
+          _ => true
+        },
+      )
+      peer_closed.put(())
+    }
+    let config = Config::new(
+      "127.0.0.1",
+      "tls-close-fault",
+      port=server.addr.port(),
+    )
+    config.keep_alive_seconds = 0
+    let client = Client::connect(config, group)
+    assert_true(
+      try {
+        client.close_with_tls_close(() => {
+          Err(Protocol("injected TLS close failure"))
+        })
+        false
+      } catch {
+        Protocol("injected TLS close failure") => true
+        _ => false
+      },
+    )
+    @async.with_timeout(1000, () => peer_closed.get())
+    assert_true(client.closed)
+    assert_true(client.disposed)
+  }
+}
+
+///|
 async test "stop during TLS handshake has no MQTT Will to revoke" {
   @async.with_task_group() <| group => {
     let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))

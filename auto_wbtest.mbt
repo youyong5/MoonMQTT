@@ -138,6 +138,87 @@ async test "stop and cancellation interrupt automatic backoff" {
 }
 
 ///|
+async test "stop without Will succeeds when current connection already closed" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    let peer_closed : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
+    group.spawn_bg() <| () => {
+      let (conn, _) = server.accept()
+      defer conn.close()
+      let _ = read_packet(conn, 4096)
+      conn.write(b"\x20\x02\x00\x00")
+      assert_true(
+        try {
+          let _ = read_packet(conn, 4096)
+          false
+        } catch {
+          _ => true
+        },
+      )
+      peer_closed.put(())
+    }
+    let config = Config::new(
+      "127.0.0.1",
+      "stop-closed-no-will",
+      port=server.addr.port(),
+    )
+    config.keep_alive_seconds = 0
+    let auto = AutoClient::start(config, group)
+    auto.wait_connected()
+    auto.current.unwrap().finish(Closed)
+    auto.stop()
+    @async.with_timeout(1000, () => peer_closed.get())
+    assert_true(auto.status() is Stopped)
+    assert_true(auto.current is None)
+  }
+}
+
+///|
+async test "stop without Will returns DISCONNECT failure after cleanup" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    let peer_closed : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
+    group.spawn_bg() <| () => {
+      let (conn, _) = server.accept()
+      defer conn.close()
+      let _ = read_packet(conn, 4096)
+      conn.write(b"\x20\x02\x00\x00")
+      assert_true(
+        try {
+          let _ = read_packet(conn, 4096)
+          false
+        } catch {
+          _ => true
+        },
+      )
+      peer_closed.put(())
+    }
+    let config = Config::new(
+      "127.0.0.1",
+      "stop-failed-no-will",
+      port=server.addr.port(),
+    )
+    config.keep_alive_seconds = 0
+    let auto = AutoClient::start(config, group)
+    auto.wait_connected()
+    assert_true(
+      try {
+        auto.stop_with_disconnect(_ => raise Closed)
+        false
+      } catch {
+        Closed => true
+        _ => false
+      },
+    )
+    @async.with_timeout(1000, () => peer_closed.get())
+    assert_true(auto.status() is Stopped)
+    assert_true(auto.current is None)
+  }
+}
+
+///|
 async test "automatic mode stops on rejected connection and permanent errors" {
   assert_true(!retryable(InvalidConfig("bad")))
   assert_true(!retryable(Protocol("bad")))

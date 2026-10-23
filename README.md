@@ -122,6 +122,18 @@ config.clean_session = false
 
 `status()` 返回 `Connecting`、`Connected(session_present)`、`Retrying(连续失败次数, 下次延迟毫秒)`、`Failed` 或 `Stopped`；`last_error()` 可查看最近的连接或终止错误。首次配置或快照读取错误由 `start()` 直接抛出。`wait_connected()` 及自动句柄上的发布、订阅、取消订阅和接收在连接中等待；永久失败时抛出原因，停止后抛 `Closed`。等待可由调用方取消。`stop()` 会停止退避，当前连接可用时先发送 DISCONNECT，再关闭连接并等待后台任务；带遗嘱时因协议没有收件确认，清理后报告 `DisconnectUncertain`，调用方不能据此判断 broker 实际是否发布遗嘱。任务组取消会直接关闭连接，不保证抑制遗嘱。
 
+配置遗嘱时，调用方应捕获停止后的不确定结果；本地资源此时已经清理：
+
+```moonbit
+try {
+  client.stop()
+} catch {
+  @client.DisconnectUncertain => println("broker 可能已发布遗嘱")
+}
+```
+
+未配置遗嘱且连接已关闭时，`stop()` 正常返回；若 DISCONNECT 发送失败，则清理后返回原始错误，不报 `DisconnectUncertain`。
+
 `AutoClient::publish()`、`subscribe()`、`unsubscribe()` 每次只在选中的连接上调用一次。**调用中途断线时，原调用返回错误，不会作为新请求自动调用第二次**；持久会话仅按 MQTT 协议恢复已登记的 QoS 1/2 在途阶段。调用方不能依据该错误判断 broker 是否收到消息，也不应盲目重发。`receive()` 可跨临时断线继续等待，但已返回消息仍受前述应用层交付边界限制。`clean_session=false` 才能保留在途和订阅状态；若 broker 回 `Session Present=0`，仍按现有规则清理旧在途并重建已确认订阅。未确认的订阅操作不会自动重新发起。
 
 退避从 `initial_delay_ms` 开始，每次失败翻倍，最高 `max_delay_ms`；成功连接后重置。网络断开、连接失败和心跳超时会重试；配置、编解码、认证拒绝、协议、`RecoveryUncertain`、存储和 `InboxFull` 错误进入 `Failed`，不会无限重试。完整示例见 [`examples/auto_resume`](examples/auto_resume/main.mbt)。
