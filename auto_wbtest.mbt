@@ -212,8 +212,73 @@ async test "stop without Will returns DISCONNECT failure after cleanup" {
         _ => false
       },
     )
+    assert_true(
+      try {
+        auto.stop()
+        false
+      } catch {
+        Closed => true
+        _ => false
+      },
+    )
     @async.with_timeout(1000, () => peer_closed.get())
     assert_true(auto.status() is Stopped)
+    assert_true(auto.current is None)
+  }
+}
+
+///|
+async test "concurrent stop waits for DISCONNECT and transport cleanup" {
+  @async.with_task_group() <| group => {
+    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    defer server.close()
+    group.spawn_bg() <| () => {
+      let (conn, _) = server.accept()
+      defer conn.close()
+      let _ = read_packet(conn, 4096)
+      conn.write(b"\x20\x02\x00\x00")
+      assert_true(
+        @mqtt.decode_packet(read_packet(conn, 4096)) is Ok(DisconnectPacket),
+      )
+    }
+    let config = Config::new(
+      "127.0.0.1",
+      "concurrent-stop",
+      port=server.addr.port(),
+    )
+    config.keep_alive_seconds = 0
+    let auto = AutoClient::start(config, group)
+    auto.wait_connected()
+    let entered : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
+    let release : @async.Queue[Unit] = @async.Queue::Queue(kind=Blocking(1))
+    let first = group.spawn(no_wait=true, allow_failure=true) <| () => {
+      auto.stop_with_disconnect(client => {
+        entered.put(())
+        release.get()
+        client.disconnect()
+      })
+    }
+    @async.with_timeout(1000, () => entered.get())
+    let second_entered : @async.Queue[Unit] = @async.Queue::Queue(
+      kind=Blocking(1),
+    )
+    let second = group.spawn(no_wait=true, allow_failure=true) <| () => {
+      auto.stop_with_disconnect(
+        client => client.disconnect(),
+        on_enter=Some(() => {
+          let _ = second_entered.try_put(()) catch { _ => false }
+        }),
+      )
+    }
+    @async.with_timeout(1000, () => second_entered.get())
+    let returned_before_cleanup = @async.with_timeout_opt(50, () => {
+        second.wait()
+      })
+      is Some(_)
+    release.put(())
+    first.wait()
+    second.wait()
+    assert_true(!returned_before_cleanup)
     assert_true(auto.current is None)
   }
 }

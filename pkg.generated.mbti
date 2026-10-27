@@ -24,7 +24,7 @@ pub suberror MqttError {
   InboxFull
   Storage(String)
   CorruptSession(String)
-  IncompatibleSessionVersion(Int)
+  IncompatibleSessionVersion(Int32)
   SessionClientIdMismatch(String)
   RecoveryUncertain
   DisconnectUncertain
@@ -45,6 +45,8 @@ pub struct AutoClient {
   mut earlier_will_uncertain : Bool
   mut task : @async.Task[Unit]?
   receive_lock : @async.Mutex
+  stop_lock : @async.Mutex
+  mut stop_error : Error?
 }
 pub fn AutoClient::last_error(Self) -> Error?
 pub async fn AutoClient::publish(Self, String, Bytes, qos? : @moonbit-mqtt.QoS, retain? : Bool) -> Unit
@@ -59,7 +61,7 @@ pub async fn AutoClient::wait_connected(Self) -> Unit
 pub(all) enum AutoStatus {
   Connecting
   Connected(Bool)
-  Retrying(Int, Int)
+  Retrying(Int32, Int32)
   Failed
   Stopped
 } derive(@debug.Debug)
@@ -73,7 +75,7 @@ pub struct Client {
   write_lock : @async.Mutex
   receive_lock : @async.Mutex
   messages : @aqueue.Queue[Message]
-  pending : Map[Int, Pending]
+  pending : Map[Int32, Pending]
   ping_reply : @aqueue.Queue[Unit]
   mut session_present : Bool
   mut closed : Bool
@@ -94,20 +96,20 @@ pub async fn Client::unsubscribe(Self, String) -> Unit
 
 pub(all) struct Config {
   host : String
-  port : Int
+  port : Int32
   client_id : String
   mut username : String?
   mut password : Bytes?
-  mut keep_alive_seconds : Int
-  mut timeout_ms : Int
-  mut max_packet_size : Int
-  mut inbox_capacity : Int
+  mut keep_alive_seconds : Int32
+  mut timeout_ms : Int32
+  mut max_packet_size : Int32
+  mut inbox_capacity : Int32
   mut clean_session : Bool
   mut session_store : SessionStore?
   mut will : Will?
   mut tls : TlsConfig?
 }
-pub fn Config::new(String, String, port? : Int) -> Self
+pub fn Config::new(String, String, port? : Int32) -> Self
 
 pub(all) struct Message {
   topic : String
@@ -120,10 +122,10 @@ pub(all) struct Message {
 type Pending
 
 pub(all) struct ReconnectPolicy {
-  initial_delay_ms : Int
-  max_delay_ms : Int
+  initial_delay_ms : Int32
+  max_delay_ms : Int32
 }
-pub fn ReconnectPolicy::new(initial_delay_ms? : Int, max_delay_ms? : Int) -> Self
+pub fn ReconnectPolicy::new(initial_delay_ms? : Int32, max_delay_ms? : Int32) -> Self
 
 type Session
 
