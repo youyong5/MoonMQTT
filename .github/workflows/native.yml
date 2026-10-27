@@ -48,18 +48,15 @@ jobs:
           archives = list(Path('_build/publish').glob('*.zip'))
           assert len(archives) == 1, archives
           with ZipFile(archives[0]) as package:
-              files = set(package.namelist())
-          required = {
+              files = sorted(package.namelist())
+          expected = sorted({
               'moon.mod', 'moon.pkg', 'pkg.generated.mbti',
               'README.md', 'LICENSE', 'auto_client.mbt',
-              'moonmqtt.mbt', 'session_store.mbt',
+              'moonmqtt.mbt', 'session_store.mbt', 'docs/design.md',
+          })
+          assert files == expected, {
+              'missing': sorted(set(expected) - set(files)),
+              'unexpected': sorted(set(files) - set(expected)),
           }
-          assert required <= files, required - files
-          forbidden = [
-              name for name in files
-              if name.startswith(('tests/', 'examples/', 'cmd/'))
-              or name.endswith(('_test.mbt', '_wbtest.mbt', '.key', '.pem', '.pfx'))
-          ]
-          assert not forbidden, forbidden
           print(f'Archive verified: {len(files)} files')
           PY

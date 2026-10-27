@@ -259,9 +259,18 @@ async test "concurrent stop waits for DISCONNECT and transport cleanup" {
       })
     }
     @async.with_timeout(1000, () => entered.get())
+    let second_entered : @async.Queue[Unit] = @async.Queue::Queue(
+      kind=Blocking(1),
+    )
     let second = group.spawn(no_wait=true, allow_failure=true) <| () => {
-      auto.stop()
+      auto.stop_with_disconnect(
+        client => client.disconnect(),
+        on_enter=Some(() => {
+          let _ = second_entered.try_put(()) catch { _ => false }
+        }),
+      )
     }
+    @async.with_timeout(1000, () => second_entered.get())
     let returned_before_cleanup = @async.with_timeout_opt(50, () => {
         second.wait()
       })

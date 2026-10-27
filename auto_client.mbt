@@ -317,7 +317,13 @@ pub async fn AutoClient::stop(self : AutoClient) -> Unit {
 async fn AutoClient::stop_with_disconnect(
   self : AutoClient,
   send_disconnect : async (Client) -> Unit,
+  on_enter~ : (() -> Unit)? = None,
 ) -> Unit {
+  // An internal observer lets the race test know this call reached stop().
+  match on_enter {
+    Some(callback) => callback()
+    None => ()
+  }
   self.stop_lock.acquire()
   defer self.stop_lock.release()
   if self.stopped {
