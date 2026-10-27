@@ -1,10 +1,12 @@
 ///|
 async test "TLS handshake times out before MQTT CONNECT" {
   @async.with_task_group() <| group => {
-    let server = @socket.TcpServer(@socket.Addr::parse("127.0.0.1:0"))
+    // localhost may resolve to either loopback family on CI runners.
+    let server = @socket.TcpServer(@socket.Addr::parse("[::]:0"))
     defer server.close()
     group.spawn_bg() <| () => {
-      let (conn, _) = server.accept()
+      let (conn, _) = @async.with_timeout(1500, () => server.accept())
+      defer conn.close()
       let header = conn.read_exactly(5)
       assert_eq(header[0], 0x16)
       let length = header[3].to_int() * 256 + header[4].to_int()
@@ -27,7 +29,6 @@ async test "TLS handshake times out before MQTT CONNECT" {
       }
       assert_true(sni)
       @async.sleep(700)
-      conn.close()
     }
     let config = Config::new(
       "localhost",
