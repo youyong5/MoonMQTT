@@ -20,9 +20,6 @@ jobs:
       - name: Show toolchain version
         run: moon version --all
 
-      - name: Install dependencies
-        run: moon install
-
       - name: Check and build
         run: |
           moon check --target native
