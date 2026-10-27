@@ -9,6 +9,7 @@ on:
 jobs:
   native:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +30,12 @@ jobs:
           moon build --target native
 
       - name: Run native tests
-        run: moon test --target native
+        run: |
+          for test_file in *_wbtest.mbt; do
+            echo "::group::${test_file}"
+            timeout 90s moon test --target native --no-parallelize "$test_file"
+            echo "::endgroup::"
+          done
 
       - name: Check generated interfaces and formatting
         run: |
@@ -38,4 +44,27 @@ jobs:
           git diff --exit-code
 
       - name: Inspect release archive
-        run: moon package --list
+        run: |
+          moon package --list
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          archives = list(Path('_build/publish').glob('*.zip'))
+          assert len(archives) == 1, archives
+          with ZipFile(archives[0]) as package:
+              files = set(package.namelist())
+          required = {
+              'moon.mod', 'moon.pkg', 'pkg.generated.mbti',
+              'README.md', 'LICENSE', 'auto_client.mbt',
+              'moonmqtt.mbt', 'session_store.mbt',
+          }
+          assert required <= files, required - files
+          forbidden = [
+              name for name in files
+              if name.startswith(('tests/', 'examples/', 'cmd/'))
+              or name.endswith(('_test.mbt', '_wbtest.mbt', '.key', '.pem', '.pfx'))
+          ]
+          assert not forbidden, forbidden
+          print(f'Archive verified: {len(files)} files')
+          PY

@@ -41,6 +41,8 @@ pub struct AutoClient {
   mut earlier_will_uncertain : Bool
   mut task : @async.Task[Unit]?
   receive_lock : @async.Mutex
+  stop_lock : @async.Mutex
+  mut stop_error : Error?
 }
 
 ///|
@@ -104,6 +106,8 @@ pub async fn[X] AutoClient::start(
     earlier_will_uncertain: false,
     task: None,
     receive_lock: @async.Mutex::Mutex(),
+    stop_lock: @async.Mutex::Mutex(),
+    stop_error: None,
   }
   self.task = Some(
     group.spawn(no_wait=true, allow_failure=true) <| () => {
@@ -314,6 +318,14 @@ async fn AutoClient::stop_with_disconnect(
   self : AutoClient,
   send_disconnect : async (Client) -> Unit,
 ) -> Unit {
+  self.stop_lock.acquire()
+  defer self.stop_lock.release()
+  if self.stopped {
+    match self.stop_error {
+      Some(e) => raise e
+      None => return
+    }
+  }
   if !self.stopped {
     self.stopped = true
     self.status = Stopped
@@ -382,10 +394,14 @@ async fn AutoClient::stop_with_disconnect(
       }
       self.current = None
       if uncertain {
+        self.stop_error = Some(DisconnectUncertain)
         raise DisconnectUncertain
       }
       match stop_error {
-        Some(e) => raise e
+        Some(e) => {
+          self.stop_error = Some(e)
+          raise e
+        }
         None => ()
       }
     })

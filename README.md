@@ -140,7 +140,7 @@ try {
 }
 ```
 
-未配置遗嘱且连接已关闭时，`stop()` 正常返回；若 DISCONNECT 发送失败，则清理后返回原始错误，不报 `DisconnectUncertain`。
+未配置遗嘱且连接已关闭时，`stop()` 正常返回；若 DISCONNECT 发送失败，则清理后返回原始错误，不报 `DisconnectUncertain`。并发调用 `stop()` 会等待同一次 DISCONNECT 与资源清理完成，并得到相同的停止结果。
 
 `AutoClient::publish()`、`subscribe()`、`unsubscribe()` 每次只在选中的连接上调用一次。**调用中途断线时，原调用返回错误，不会作为新请求自动调用第二次**；持久会话仅按 MQTT 协议恢复已登记的 QoS 1/2 在途阶段。调用方不能依据该错误判断 broker 是否收到消息，也不应盲目重发。`receive()` 可跨临时断线继续等待，但已返回消息仍受前述应用层交付边界限制。`clean_session=false` 才能保留在途和订阅状态；若 broker 回 `Session Present=0`，仍按现有规则清理旧在途并重建已确认订阅。未确认的订阅操作不会自动重新发起。
 

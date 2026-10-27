@@ -211,6 +211,15 @@ async test "successful local DISCONNECT write cannot prove Will was discarded" {
         _ => false
       },
     )
+    assert_true(
+      try {
+        auto.stop()
+        false
+      } catch {
+        DisconnectUncertain => true
+        _ => false
+      },
+    )
     assert_true(auto.status() is Stopped)
   }
 }
