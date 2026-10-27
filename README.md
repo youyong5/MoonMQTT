@@ -2,6 +2,10 @@
 
 `youyong5/moonmqtt` 是供其他 MoonBit 程序调用的 MQTT 3.1.1 客户端库。当前使用 `moonbitlang/async` 的原生 TCP 与 TLS，使用 `zbhzs1/moonbit-mqtt` 编解码 MQTT 报文。目标平台为 MoonBit **native**；明文 TCP 与 MQTT over TLS 均可配置。
 
+## 0.1.1 更新说明
+
+相对 0.1.0，此补丁版本修复并发调用 `AutoClient::stop()` 时后续调用可能在首次调用发送 DISCONNECT 和清理传输层前返回的问题；同一轮停止的调用现在等待清理完成并取得一致的停止结果。新增 native CI、精确的九文件发布归档检查，以及 Windows 上的 Mosquitto 明文、会话、遗嘱和 TLS 互通 CI。没有新增或删除公开函数。`moon info` 在当前工具链下将接口文件中的部分 `Int` 写为 `Int32`，并列出 `AutoClient` 的内部停止状态字段；这些是生成接口文本的变化。同一份公开 API 示例已分别用 0.1.0 和 0.1.1 归档完成独立项目 native 编译。
+
 ## 能力矩阵
 
 | 能力 | 当前状态 |
@@ -34,7 +38,7 @@
 库在[本仓库的 `examples/basic`](https://github.com/youyong5/MoonMQTT/tree/main/examples/basic) 中有可运行示例。其他 MoonBit 项目先添加依赖：
 
 ```powershell
-moon add youyong5/moonmqtt@0.1.0
+moon add youyong5/moonmqtt@0.1.1
 moon add moonbitlang/async@0.22.5
 moon add zbhzs1/moonbit-mqtt@0.1.0
 ```
