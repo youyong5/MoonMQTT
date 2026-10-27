@@ -1,0 +1,60 @@
+name: Mosquitto interoperability
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  interop:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MoonBit
+        shell: pwsh
+        run: |
+          irm https://cli.moonbitlang.com/install/powershell.ps1 | iex
+          "$HOME\.moon\bin" >> $env:GITHUB_PATH
+
+      - name: Install Mosquitto 2.0.22
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'mosquitto-2.0.22.exe'
+          Invoke-WebRequest 'https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe' -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Mosquitto installer exited $($process.ExitCode)" }
+          foreach ($exe in @('mosquitto.exe', 'mosquitto_pub.exe', 'mosquitto_sub.exe')) {
+            if (-not (Test-Path (Join-Path 'C:\Program Files\mosquitto' $exe))) {
+              throw "Missing Mosquitto executable: $exe"
+            }
+          }
+          $service = Get-Service mosquitto -ErrorAction SilentlyContinue
+          if ($service -and $service.Status -eq 'Running') { Stop-Service mosquitto }
+          & 'C:\Program Files\mosquitto\mosquitto.exe' -h | Select-Object -First 1
+
+      - name: Build native examples
+        shell: pwsh
+        run: |
+          moon version --all
+          moon update
+          moon build --target native
+
+      - name: Run plaintext, session, will and TLS interoperability
+        shell: powershell
+        run: |
+          .\tests\interop.ps1 -MosquittoDirectory 'C:\Program Files\mosquitto'
+
+      - name: Upload interop diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs
+          path: |
+            .tools/interop/**/*.log
+            .tools/interop/**/*.txt
+            .tools/interop/*.log
+            .tools/interop/*.txt
+          if-no-files-found: ignore
