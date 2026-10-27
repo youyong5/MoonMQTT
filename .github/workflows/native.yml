@@ -33,7 +33,14 @@ jobs:
         run: |
           for test_file in *_wbtest.mbt; do
             echo "::group::${test_file}"
-            timeout 90s moon test --target native --no-parallelize "$test_file"
+            if [ "$test_file" = tls_wbtest.mbt ]; then
+              for index in 0 1 2 3 4; do
+                echo "TLS test index ${index}"
+                timeout 25s moon test --target native "$test_file" -i "$index"
+              done
+            else
+              timeout 90s moon test --target native --no-parallelize "$test_file"
+            fi
             echo "::endgroup::"
           done
 
