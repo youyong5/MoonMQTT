@@ -189,4 +189,6 @@ powershell -ExecutionPolicy Bypass -File tests\interop.ps1 -MosquittoDirectory '
 # 单跑 TLS：powershell -ExecutionPolicy Bypass -File tests\tls_interop.ps1 -MosquittoDirectory 'D:\path\to\mosquitto\bin'
 ```
 
+GitHub Actions 的 `Mosquitto interoperability` 工作流在 Windows runner 上运行同一总脚本，使用 Mosquitto 2.0.22。TLS 测试在运行时生成临时 CA、服务器证书和私钥；失败时仅上传文本日志，不上传密钥。该互通测试验证上述客户端与 Mosquitto 之间的行为；模拟 broker 的异常确认、分片和存储故障仍由 native 单元测试覆盖。
+
 本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出、QoS 2 连续重复 PUBREC、旧 `Client` 在主动关闭和异常断线后的同进程恢复、关闭与异步保存交错、跨进程 QoS 1/2 重发、损坏快照、存储故障前不发送确认、持久会话两种 `Session Present` 结果，以及自动模式的退避上限、停止/取消、QoS 1/2 在途恢复、订阅重建和永久错误。遗嘱测试检查非法配置、CONNECT 字段、每代重连携带相同遗嘱、DISCONNECT 发送失败，以及握手和退避交错时的停止结果。TLS 回归覆盖 ClientHello SNI、握手超时、握手中停止和不可读 CA。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。
