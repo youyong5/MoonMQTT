@@ -26,9 +26,12 @@
 | `examples/auto_resume` | 稳定自动句柄及 broker 重启后的订阅恢复示例 |
 | `examples/will_probe`、`tests/will_interop.ps1` | Mosquitto 遗嘱主题、QoS、retain、异常断线和自动重连互通 |
 | `examples/tls_probe`、`tests/tls_interop.ps1` | Mosquitto TLS listener、证书拒绝、双向 QoS、持久会话与自动重连互通 |
+| `examples/auth_probe`、`tests/auth_interop.ps1` | Mosquitto 禁止匿名的独立 listener；公开用户名/密码配置、QoS 1 收发和两种明确的认证拒绝 |
 | `examples/interop_pub`、`examples/interop_sub`、`tests/interop.ps1` | Mosquitto CLI 双向互通和真实会话续接 |
 
 `Config::new(host, client_id, port?)` 后可配置 `clean_session`（默认 `true`）、用户名/密码、Keep Alive、超时、报文上限和接收队列容量。`clean_session=false` 时可设置 `config.session_store = Some(SessionStore::file(path))`，也可用 `SessionStore::new(load, save)` 接入应用存储。`Client::connect(config, group)` 先读取并校验快照，再建立 TCP 和完成 CONNECT/CONNACK；无快照时才创建新本地会话。`Client::session_present()` 返回本次 CONNACK 状态。旧 `Client::reconnect(group)` 沿用同进程内存会话；进程重启则以相同 Client ID 和存储重新调用 `Client::connect`。不能对 clean session 配置存储或调用 `reconnect`，同一会话也不能同时连接两条 TCP。
+
+认证互通通过公开的 `Config.username` 和二进制 `Config.password` 设置 CONNECT 字段，在随机生成的 Mosquitto password file 上验证 QoS 1 回环。错误密码和不带凭据的连接只接受 `Rejected(NotAuthorized)` 或 `Rejected(BadUserNameOrPassword)` 作为预期结果；超时、TCP 失败或其他异常均令测试失败。password file、凭据和该 listener 的日志位于系统临时目录，不属于发布归档或 CI 诊断 artifact。
 
 `config.will = Some(Will::new(topic, payload, qos?, retain?))` 在每次 CONNECT 构造时取值。主题不能为空、不能有主题过滤通配符，且须通过 MQTT UTF-8 字符串编码；负载是任意字节，受 CONNECT 中两字节长度字段限制，最多 65535 字节。配置在连接前验证，非法值抛 `InvalidConfig`。遗嘱不属于客户端持久会话快照；重新建立 TCP 时按当前固定配置再次发送，broker 对每一代连接分别管理其遗嘱。
 
