@@ -184,15 +184,16 @@ moon test --target native
 moon run examples/basic --target native
 ```
 
-端到端测试需要 Mosquitto broker、`mosquitto_pub`、`mosquitto_sub` 和 OpenSSL（脚本默认使用 Git for Windows 自带的 `openssl.exe`）。总脚本自行启动和关闭本地 broker，先运行明文 QoS、会话续接、自动重连与遗嘱回归，再用临时测试 CA 启动 TLS listener，验证默认/指定 CA、错误主机名、双向 QoS 0/1/2、跨进程持久会话与自动重连：
+端到端测试需要 Mosquitto broker、`mosquitto_pub`、`mosquitto_sub`、`mosquitto_passwd` 和 OpenSSL（脚本默认使用 Git for Windows 自带的 `openssl.exe`）。总脚本自行启动和关闭本地 broker，依次验证明文 QoS、会话续接、自动重连、遗嘱和 TLS；认证场景另启禁止匿名连接的 listener，验证正确凭据完成 QoS 1 收发，错误密码和无凭据返回明确的 MQTT 拒绝错误：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\interop.ps1
 # 若 Mosquitto 不在默认安装目录：
 powershell -ExecutionPolicy Bypass -File tests\interop.ps1 -MosquittoDirectory 'D:\path\to\mosquitto\bin'
 # 单跑 TLS：powershell -ExecutionPolicy Bypass -File tests\tls_interop.ps1 -MosquittoDirectory 'D:\path\to\mosquitto\bin'
+# 单跑认证（先 moon build）：powershell -ExecutionPolicy Bypass -File tests\auth_interop.ps1 -MosquittoDirectory 'D:\path\to\mosquitto\bin'
 ```
 
-GitHub Actions 的 `Mosquitto interoperability` 工作流在 Windows runner 上运行同一总脚本，使用 Mosquitto 2.0.22。TLS 测试在运行时生成临时 CA、服务器证书和私钥；失败时仅上传文本日志，不上传密钥。该互通测试验证上述客户端与 Mosquitto 之间的行为；模拟 broker 的异常确认、分片和存储故障仍由 native 单元测试覆盖。
+GitHub Actions 的 `Mosquitto interoperability` 工作流在 Windows runner 上运行同一总脚本，使用 Mosquitto 2.0.22。TLS 测试在运行时生成临时 CA、服务器证书和私钥；认证测试在系统临时目录生成随机凭据与 password file，并在结束时删除。失败时仅上传仓库内的文本日志，不上传证书私钥或认证凭据。该互通测试验证上述客户端与 Mosquitto 之间的行为；模拟 broker 的异常确认、分片和存储故障仍由 native 单元测试覆盖。
 
 本地模拟 broker 的测试还覆盖拒绝连接、意外断开、错误报文、分片/合包、并发 ID 与乱序确认、取消、超时、队列溢出、QoS 2 连续重复 PUBREC、旧 `Client` 在主动关闭和异常断线后的同进程恢复、关闭与异步保存交错、跨进程 QoS 1/2 重发、损坏快照、存储故障前不发送确认、持久会话两种 `Session Present` 结果，以及自动模式的退避上限、停止/取消、QoS 1/2 在途恢复、订阅重建和永久错误。遗嘱测试检查非法配置、CONNECT 字段、每代重连携带相同遗嘱、DISCONNECT 发送失败，以及握手和退避交错时的停止结果。TLS 回归覆盖 ClientHello SNI、握手超时、握手中停止和不可读 CA。设计依据和依赖取舍见 [docs/design.md](docs/design.md)。

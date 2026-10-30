@@ -26,7 +26,7 @@ jobs:
           Invoke-WebRequest 'https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe' -OutFile $installer
           $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Mosquitto installer exited $($process.ExitCode)" }
-          foreach ($exe in @('mosquitto.exe', 'mosquitto_pub.exe', 'mosquitto_sub.exe')) {
+          foreach ($exe in @('mosquitto.exe', 'mosquitto_pub.exe', 'mosquitto_sub.exe', 'mosquitto_passwd.exe')) {
             if (-not (Test-Path (Join-Path 'C:\Program Files\mosquitto' $exe))) {
               throw "Missing Mosquitto executable: $exe"
             }
@@ -42,7 +42,7 @@ jobs:
           moon update
           moon build --target native
 
-      - name: Run plaintext, session, will and TLS interoperability
+      - name: Run plaintext, session, will, TLS and authentication interoperability
         shell: powershell
         run: |
           .\tests\interop.ps1 -MosquittoDirectory 'C:\Program Files\mosquitto'

@@ -249,3 +249,4 @@ finally { Pop-Location }
 
 & (Join-Path $PSScriptRoot 'will_interop.ps1') -MosquittoDirectory $MosquittoDirectory
 & (Join-Path $PSScriptRoot 'tls_interop.ps1') -MosquittoDirectory $MosquittoDirectory
+& (Join-Path $PSScriptRoot 'auth_interop.ps1') -MosquittoDirectory $MosquittoDirectory
