@@ -14,6 +14,7 @@ import {
 pub async fn[X] with_client(Config, async (Client) -> X) -> X
 
 // Errors
+#derive(@debug.Debug)
 pub suberror MqttError {
   InvalidConfig(String)
   Codec(String)
@@ -29,7 +30,7 @@ pub suberror MqttError {
   RecoveryUncertain
   DisconnectUncertain
   TlsValidation(String)
-} derive(@debug.Debug)
+}
 pub fn MqttError::to_repr(Self) -> @debug.Repr
 
 // Types and methods
@@ -58,13 +59,14 @@ pub async fn AutoClient::subscribe(Self, String, @moonbit-mqtt.QoS) -> @moonbit-
 pub async fn AutoClient::unsubscribe(Self, String) -> Unit
 pub async fn AutoClient::wait_connected(Self) -> Unit
 
+#derive(@debug.Debug)
 pub(all) enum AutoStatus {
   Connecting
   Connected(Bool)
   Retrying(Int32, Int32)
   Failed
   Stopped
-} derive(@debug.Debug)
+}
 pub fn AutoStatus::to_repr(Self) -> @debug.Repr
 
 pub struct Client {
