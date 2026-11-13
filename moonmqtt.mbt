@@ -80,6 +80,7 @@ pub(all) struct Message {
 }
 
 ///|
+#derive(Debug)
 pub suberror MqttError {
   InvalidConfig(String)
   Codec(String)
@@ -95,7 +96,7 @@ pub suberror MqttError {
   RecoveryUncertain
   DisconnectUncertain
   TlsValidation(String)
-} derive(Debug)
+}
 
 ///|
 pub extend MqttError with @debug.Debug::{to_repr}

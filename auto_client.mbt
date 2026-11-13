@@ -16,13 +16,14 @@ pub fn ReconnectPolicy::new(
 ///|
 /// Connected carries the current CONNACK Session Present bit.
 /// Retrying carries the consecutive failure count and next delay in ms.
+#derive(Debug)
 pub(all) enum AutoStatus {
   Connecting
   Connected(Bool)
   Retrying(Int32, Int32)
   Failed
   Stopped
-} derive(Debug)
+}
 
 ///|
 pub extend AutoStatus with @debug.Debug::{to_repr}

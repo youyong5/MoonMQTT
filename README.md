@@ -174,6 +174,8 @@ broker 回 `Session Present=0` 后，已确认的订阅会自动重建。若重�
 
 ## 运行和测试
 
+工具链兼容性记录（2026-11-13）：在 Linux x86_64 使用 MoonBit 官方安装脚本获取当前工具链，`moon version --all` 显示 `moon 0.1.20261104 (940aa18 2026-11-04)`、`moonc v0.10.20+65efd5b93 (2026-11-05)`、`moonrun 0.1.20261104 (940aa18 2026-11-04)`。本库目标后端为 **native**，依赖 `moonbitlang/async@0.22.5` 和 `zbhzs1/moonbit-mqtt@0.1.0`；在该工具链下完成 native 检查、构建和 69 项测试，并以本地 Mosquitto 2.0.22 运行 `examples/basic`，收到 `moonmqtt/example: hello`。Ubuntu native 和 Windows Mosquitto CI 均安装官方当前工具链，并记录 `moon version --all`；其他后端不在本项目支持范围内。
+
 ```powershell
 cd D:\Projects\MoonMQTT
 moon info
